@@ -1,0 +1,36 @@
+# Virtual environments
+.venv/
+venv/
+
+# Python bytecode/caches
+__pycache__/
+*.pyc
+*.pyo
+
+# Local SQLite cache data
+data/*.db
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+
+# Environment secrets
+.env
+
+# Test/tool caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Streamlit local config/secrets
+.streamlit/
+
+# Packaging artifacts
+*.egg-info/
+build/
+dist/
+
+# Editor/OS cruft
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

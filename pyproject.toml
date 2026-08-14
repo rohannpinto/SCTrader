@@ -1,0 +1,13 @@
+[tool.pytest.ini_options]
+# Default run excludes both custom marker groups so the fast feedback loop
+# (`pytest`) never hits the network or runs slow benchmarks:
+#   pytest              -> default suite only (fast, offline, respx-mocked)
+#   pytest -m live      -> run ONLY the live smoke tests (hits real APIs)
+#   pytest -m perf      -> run ONLY the perf benchmarks (slow, synthetic data)
+#   pytest -m "live or perf"  -> run both excluded groups explicitly
+addopts = "-m \"not live and not perf\""
+testpaths = ["tests"]
+markers = [
+    "live: hits real external APIs; excluded by default, run explicitly with `pytest -m live`",
+    "perf: synthetic large-graph performance benchmark; excluded by default, run explicitly with `pytest -m perf`",
+]
