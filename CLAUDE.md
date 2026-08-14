@@ -196,6 +196,55 @@ Copy `.env.example` to `.env` and adjust values as needed; `.env` is
 gitignored and read automatically by `backend/config.py` via
 `pydantic-settings`.
 
+## Data source implementation notes
+
+Empirical findings from Task 2 (`wiki_client.py`) and Task 3
+(`uex_client.py`)'s research spikes, recorded here so later tasks (Task 4's
+ingestion pipeline especially) don't have to re-derive them. Full detail
+and evidence lives in each client's module docstring — this is the
+shared-context summary.
+
+- **Wiki API base URL confirmed:** `https://api.star-citizen.wiki/api` (the
+  original placeholder in `backend/config.py` needed no change).
+- **UEX API base URL corrected:** use `https://api.uexcorp.uk/2.0`, **not**
+  `https://uexcorp.space/api/2.0` (the original placeholder). Both front
+  the same API/dataset, but `uexcorp.space` sits behind Cloudflare
+  bot-management that fingerprints the TLS/HTTP client itself — it blocks
+  Python `httpx` even with a full browser-like header set (not a
+  User-Agent-string check, so adding headers doesn't fix it). `api
+  .uexcorp.uk` has no such block and needs zero special headers. No API key
+  is required for any endpoint this app uses (`terminals`,
+  `terminals_distances`, `orbits_distances`, `star_systems`).
+- **Wiki-to-UEX terminal ID join is direct and clean — no fallback
+  needed.** The wiki API's `terminal_id`/`terminal_code` fields (on each
+  commodity's `uex_prices.purchase[]` entry) are UEX's own terminal `id`/
+  `code` values, verbatim (the wiki API sources this data from UEX in the
+  first place). Verified exactly across every entry in a real fixture
+  (26/26 matched). Task 4 should join on `terminal_id == id` directly; the
+  design plan's name+system fallback contingency should not be needed.
+- **Bulk distance ingestion: use `orbits_distances`, not per-pair
+  `terminals_distances`.** `terminals_distances` only supports a
+  single-pair lookup (`id_terminal_origin` + `id_terminal_destination`,
+  both required) — useful for spot checks/fallback, but a full distance
+  matrix via that endpoint alone would be up to ~12,880 individual
+  requests for the 161 real commodity terminals. `orbits_distances
+  ?id_star_system={id}` instead returns **every** orbit-pair distance
+  within a system in one call (an "orbit" is coarser than a terminal —
+  each terminal has one parent `id_orbit`, and the 161 commodity terminals
+  collapse onto only 49 distinct orbits). Only 3 star systems are
+  currently available/playable (`is_available == 1` on `/star_systems`:
+  Nyx=55, Pyro=64, Stanton=68 — derive this dynamically, don't hardcode
+  it, so a newly-live system is picked up automatically). One
+  `/star_systems` call plus one `/orbits_distances` call per available
+  system (4 requests total today) gives complete, verified-zero-gap
+  coverage of every orbit pair needed to connect all real commodity
+  terminals (Nyx 42/42 directed pairs, Pyro 272/272, Stanton 600/600).
+  Distances are **directional, not reliably symmetric** (a small number of
+  Stanton pairs, all touching a jump-point-gateway orbit, differ by
+  direction) — store/look up both directions rather than assuming
+  symmetry. `UexClient.iter_all_orbit_distances()` /
+  `.list_all_orbit_distances()` implement this bulk strategy end to end.
+
 ## Standing security ground rules
 
 These apply to **every** task, not just the ones that mention security

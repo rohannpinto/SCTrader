@@ -27,7 +27,19 @@ class Settings(BaseSettings):
 
     # --- External API endpoints ---
     wiki_api_base_url: str = "https://api.star-citizen.wiki/api"
-    uex_api_base_url: str = "https://uexcorp.space/api/2.0"
+    # Verified empirically (2026-08-14, Task 3) -- see `backend/clients/
+    # uex_client.py`'s module docstring. `uexcorp.space/api/2.0` (the
+    # original placeholder here) fronts the exact same API but has
+    # Cloudflare bot-management enabled that blocks Python `httpx` clients
+    # (TLS/HTTP fingerprinting, not a UA-string check -- survives even a
+    # full browser-like header set). `api.uexcorp.uk` is UEX's other public
+    # domain for the identical API/dataset and has no such block; `httpx`
+    # reaches it with zero special headers. No API key is required for the
+    # endpoints this app uses (`terminals`, `terminals_distances`,
+    # `star_systems`) -- confirmed via UEX's own docs (no "Bearer
+    # Authorization Required" lock icon on those three) and by successful
+    # anonymous requests.
+    uex_api_base_url: str = "https://api.uexcorp.uk/2.0"
     uex_api_key: str | None = None
 
     # --- /refresh shared-secret gate (unset = disabled, local dev only) ---
