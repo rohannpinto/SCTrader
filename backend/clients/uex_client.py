@@ -537,6 +537,16 @@ class UexClient:
             base_url=self._settings.uex_api_base_url,
             timeout=self._settings.http_timeout_seconds,
             headers=headers,
+            # See `wiki_client.WikiClient.__init__`'s matching comment: httpx
+            # defaults `follow_redirects` to `False` (unlike `requests`),
+            # which silently breaks on any endpoint that ever replies with a
+            # redirect. No UEX endpoint used here has been observed to
+            # redirect in practice, but this is set for consistency and
+            # robustness regardless. Safe to follow blindly: this client
+            # only issues GET requests against a fixed, hardcoded, trusted
+            # base URL -- never a user-supplied URL -- so there's no
+            # open-redirect/SSRF concern.
+            follow_redirects=True,
         )
         # `http_max_retries` is read as "how many retries", i.e. attempts
         # *beyond* the first -- total attempts = 1 + http_max_retries.

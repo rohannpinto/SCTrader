@@ -351,6 +351,46 @@ def test_timeout_is_retried_then_gives_up(no_real_sleep):
     assert len(no_real_sleep) == 1
 
 
+# --- redirect handling ----------------------------------------------------
+
+
+@respx.mock
+def test_follows_redirect_transparently(no_real_sleep):
+    """Regression test for the real bug where the wiki API's own
+    `links.next` pagination field returns an absolute `http://` URL (for
+    real, observed on `/commodities` page 2) that the live API 301-redirects
+    to the `https://` version. httpx defaults `follow_redirects` to `False`
+    (unlike `requests`), so without `follow_redirects=True` on the
+    underlying `httpx.Client`, the client would receive the redirect's HTML
+    body and blow up trying to parse it as JSON instead of transparently
+    following it. Doesn't need to be pagination specifically to prove the
+    fix -- any request path redirecting is sufficient."""
+    raw = _load_fixture("wiki_commodity_laranite.json")
+    redirect_route = respx.get(f"{BASE_URL}/commodities/laranite").mock(
+        return_value=httpx.Response(
+            301,
+            headers={"Location": f"{BASE_URL}/commodities/laranite-redirected"},
+            text="<html>301 Moved Permanently</html>",
+        )
+    )
+    target_route = respx.get(f"{BASE_URL}/commodities/laranite-redirected").mock(
+        return_value=httpx.Response(200, json=raw)
+    )
+
+    client = WikiClient(settings=_settings())
+    try:
+        detail = client.get_commodity_detail("laranite")
+    finally:
+        client.close()
+
+    assert redirect_route.call_count == 1
+    assert target_route.call_count == 1
+    assert detail.slug == "laranite"
+    assert len(detail.purchase_entries) == 26
+    # A followed redirect isn't a retryable failure -- no backoff wait.
+    assert no_real_sleep == []
+
+
 # --- live smoke test (excluded by default; run with `pytest -m live`) --
 
 

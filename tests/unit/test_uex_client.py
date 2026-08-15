@@ -383,6 +383,43 @@ def test_timeout_is_retried_then_gives_up(no_real_sleep):
     assert len(no_real_sleep) == 1
 
 
+# --- redirect handling ----------------------------------------------------
+
+
+@respx.mock
+def test_follows_redirect_transparently(no_real_sleep):
+    """Regression test mirroring `test_wiki_client.py`'s equivalent: no
+    live UEX endpoint has been observed to redirect in practice, but
+    `follow_redirects=True` was added to this client's `httpx.Client` for
+    consistency/robustness -- confirm it's actually honored rather than
+    silently returning a redirect's body (which, unlike the wiki API's
+    Cloudflare HTML page, would likely fail JSON parsing or `status`
+    validation here too)."""
+    raw = _load_fixture("uex_terminals_sample.json")
+    redirect_route = respx.get(f"{BASE_URL}/terminals").mock(
+        return_value=httpx.Response(
+            301,
+            headers={"Location": f"{BASE_URL}/terminals-redirected"},
+            text="<html>301 Moved Permanently</html>",
+        )
+    )
+    target_route = respx.get(f"{BASE_URL}/terminals-redirected").mock(
+        return_value=httpx.Response(200, json=raw)
+    )
+
+    client = UexClient(settings=_settings())
+    try:
+        terminals = client.list_terminals()
+    finally:
+        client.close()
+
+    assert redirect_route.call_count == 1
+    assert target_route.call_count == 1
+    assert len(terminals) == 9
+    # A followed redirect isn't a retryable failure -- no backoff wait.
+    assert no_real_sleep == []
+
+
 # --- optional API key wiring ------------------------------------------------
 
 

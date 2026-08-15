@@ -286,6 +286,19 @@ class WikiClient:
             base_url=self._settings.wiki_api_base_url,
             timeout=self._settings.http_timeout_seconds,
             headers={"Accept": "application/json"},
+            # The wiki API's own `links.next` pagination field returns an
+            # absolute `http://` URL for at least one real page (observed on
+            # `/commodities` page 2) even though the API itself is served
+            # over `https://`; requesting that literal URL gets a `301`
+            # redirect (via Cloudflare) to the `https://` version. httpx
+            # defaults `follow_redirects` to `False` (unlike `requests`),
+            # so without this the client would receive the redirect's HTML
+            # body and fail trying to parse it as JSON. Safe to follow
+            # blindly here: this client only ever issues GET requests
+            # against a fixed, hardcoded, trusted base URL -- never a
+            # user-supplied URL -- so there's no open-redirect/SSRF concern
+            # from doing so.
+            follow_redirects=True,
         )
         # `http_max_retries` is read as "how many retries", i.e. attempts
         # *beyond* the first -- total attempts = 1 + http_max_retries.
