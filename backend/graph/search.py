@@ -11,7 +11,9 @@ travelled <= a caller-chosen budget.
 Algorithm (per CLAUDE.md, verbatim structure)
 ------------------------------------------------
 - A *label* is `(current_node, distance_used_so_far, cumulative_weight,
-  path)` -- `_Label` below.
+  path)` -- `_Label` below. Internally, `path` is represented lazily as a
+  `previous` parent pointer rather than a materialized tuple; see `_Label`'s
+  docstring and `_path_from_label`.
 - Explored with a max-priority queue ordered by `cumulative_weight`
   (best-first): a `heapq` min-heap keyed on `-cumulative_weight`, with a
   monotonic tiebreak counter so two labels with equal weight never need a
@@ -110,12 +112,25 @@ class _Label:
     `_ActiveLabels` and the heap's lazy-deletion check need to ask "is this
     the *same* label instance still active," not "does some other label
     happen to have equal field values."
+
+    `previous` is a parent pointer, not the full path: rebuilding a label's
+    path by concatenating a new tuple at every hop (`path + (successor,)`)
+    is an O(depth) copy *per label created*. On a dense, best-first search
+    that reaches thousands of hops deep before a time/label-cap safety valve
+    fires, that made label creation itself O(depth), and -- worse -- left
+    ~10^5 labels alive at once each holding its own largely-independent long
+    tuple, so the reference-counting deallocation cascade when `heap`/
+    `active` went out of scope dominated wall time *after* the search loop
+    had already correctly stopped on schedule. A parent pointer makes label
+    creation O(1); only the single winning `best_label`, at the very end of
+    `find_best_route`, ever pays to walk its chain back to the start and
+    materialize an actual path -- see `_path_from_label`.
     """
 
     node: int
     distance_used: float
     cumulative_weight: float
-    path: tuple[int, ...]
+    previous: "_Label | None"
 
 
 class _ActiveLabels:
@@ -205,6 +220,23 @@ class RouteSearchResult:
     message: str | None = None
 
 
+def _path_from_label(label: _Label) -> tuple[int, ...]:
+    """Materialize a label's full path by walking its `previous` chain back
+    to the start label (`previous is None`), then reversing.
+
+    Only ever called once per search, on the single winning `best_label` --
+    every other label generated during the search stays a cheap O(1)
+    parent-pointer node and never pays this cost. See `_Label`'s docstring.
+    """
+    nodes: list[int] = []
+    current: _Label | None = label
+    while current is not None:
+        nodes.append(current.node)
+        current = current.previous
+    nodes.reverse()
+    return tuple(nodes)
+
+
 def _hops_from_path(graph: nx.DiGraph, path: tuple[int, ...]) -> tuple[RouteHopResult, ...]:
     hops = []
     for origin, destination in zip(path, path[1:]):
@@ -245,7 +277,7 @@ def find_best_route(
         return _not_found(start_terminal_id)
 
     start_label = _Label(
-        node=start_terminal_id, distance_used=0.0, cumulative_weight=0.0, path=(start_terminal_id,)
+        node=start_terminal_id, distance_used=0.0, cumulative_weight=0.0, previous=None
     )
     best_label = start_label
 
@@ -284,7 +316,7 @@ def find_best_route(
                 node=successor,
                 distance_used=new_distance_used,
                 cumulative_weight=label.cumulative_weight + edge["weight"],
-                path=label.path + (successor,),
+                previous=label,
             )
 
             # Recorded as a candidate answer regardless of whether dominance
@@ -299,7 +331,7 @@ def find_best_route(
     if best_label.cumulative_weight <= 0:
         return _not_found(start_terminal_id)
 
-    hops = _hops_from_path(graph, best_label.path)
+    hops = _hops_from_path(graph, _path_from_label(best_label))
     return RouteSearchResult(
         found=True,
         start_terminal_id=start_terminal_id,

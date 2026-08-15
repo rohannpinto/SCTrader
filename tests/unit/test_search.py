@@ -8,6 +8,9 @@ the weight-formula implementation covered by `test_graph_builder.py`.
 
 from __future__ import annotations
 
+import random
+import time
+
 import networkx as nx
 import pytest
 
@@ -281,5 +284,85 @@ def test_label_cap_still_returns_valid_answer_on_dense_graph():
     assert result.total_distance <= 40.0
     # Every reported hop must correspond to a real edge in the graph.
     path = [1] + [hop.terminal_id for hop in result.hops]
+    for origin, destination in zip(path, path[1:]):
+        assert graph.has_edge(origin, destination)
+
+
+# --- deep-path label generation: parent-pointer reconstruction -----------------
+#
+# Regression coverage for the O(depth) `path + (successor,)` tuple-copy bug
+# (see `backend/graph/search.py`'s `_Label` docstring): label creation must
+# stay cheap regardless of how deep the search goes, and the single winning
+# label's path must still be reconstructed correctly -- in the right order,
+# starting from the start node -- from the parent-pointer chain. These run
+# in the always-on default suite (unlike `tests/perf/test_perf.py`, which is
+# `-m perf`-only) at a scale small enough to stay fast, but deep enough to
+# actually exercise the reconstruction at real depth.
+
+
+def test_very_long_path_reconstructed_correctly_and_in_order():
+    # A long, unbranching chain: no dominance ties, no ambiguity -- the
+    # winning path must be exactly the full chain, start-to-end, in order.
+    chain_length = 1500
+    edges = [(i, i + 1, 1.0, 1.0, 1.0, i) for i in range(1, chain_length)]
+    graph = _graph(edges)
+
+    result = find_best_route(
+        graph,
+        start_terminal_id=1,
+        max_distance=float(chain_length),
+        distance_threshold=10.0,
+        settings=_settings(search_label_cap_per_node=5),
+    )
+
+    assert result.found is True
+    assert len(result.hops) == chain_length - 1
+    visited = [1] + [hop.terminal_id for hop in result.hops]
+    assert visited == list(range(1, chain_length + 1))
+    assert result.total_weight == float(chain_length - 1)
+
+
+def test_deep_dense_cyclic_search_generates_many_labels_without_blowing_up():
+    # A smaller, fast-running cousin of
+    # tests/perf/test_perf.py::test_search_respects_time_budget_on_large_dense_graph
+    # -- dense, cyclic, plenty of positive-weight cycles, so best-first
+    # search generates many long-chained labels before the (tight) time
+    # budget or label cap stops it. Runs on every default `pytest`
+    # invocation, not just `-m perf`, so this catches a reintroduced O(depth)
+    # label-creation or teardown-cascade regression immediately.
+    rng = random.Random(20260815)
+    node_count = 150
+    out_degree = 10
+    edges = []
+    for node in range(node_count):
+        successors = rng.sample([n for n in range(node_count) if n != node], k=out_degree)
+        for successor in successors:
+            distance = float(rng.randint(1, 5))
+            weight = float(rng.randint(1, 10)) if rng.random() < 0.4 else 0.0
+            edges.append((node, successor, distance, weight, weight * distance, 1 if weight else None))
+    graph = _graph(edges)
+
+    started = time.monotonic()
+    result = find_best_route(
+        graph,
+        start_terminal_id=0,
+        max_distance=100_000.0,
+        distance_threshold=1000.0,
+        settings=_settings(search_time_budget_seconds=1.0, search_label_cap_per_node=30),
+    )
+    elapsed = time.monotonic() - started
+
+    assert result.found is True
+    # The winning path should be many hops deep, exercising parent-pointer
+    # reconstruction at real depth, not just the couple-of-hops paths every
+    # other test in this file uses.
+    assert len(result.hops) >= 50
+    # Generous bound well beyond the configured 1.0s search budget: a guard
+    # against the post-loop reference-counting teardown cascade this test
+    # targets, not a strict timing SLA on a slow/loaded machine.
+    assert elapsed < 5.0, f"find_best_route() took {elapsed:.2f}s -- deep-path teardown regression?"
+
+    # Every reported hop must correspond to a real edge in the graph.
+    path = [0] + [hop.terminal_id for hop in result.hops]
     for origin, destination in zip(path, path[1:]):
         assert graph.has_edge(origin, destination)
