@@ -16,7 +16,9 @@ Schema
                    (`wiki_terminal_id`, `uex_terminal_id`) so only the
                    ingestion task ever has to reconcile them. Every other
                    part of the app refers to terminals solely by the
-                   internal `id`.
+                   internal `id`. `id_orbit` (Task 4) carries UEX's orbit
+                   grouping, used by the ingestion pipeline's distance-
+                   expansion algorithm.
 - `Price`       -- current known buy/sell price for one commodity at one
                    terminal (no history kept). Composite primary key
                    `(terminal_id, commodity_id)` -- this *is* the composite
@@ -133,6 +135,16 @@ class Terminal(Base):
     location_name: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     is_commodity_trading: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     raw_type: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    id_orbit: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True, index=True
+    )
+    """UEX's `id_orbit` for this terminal (Task 4). `None` when unknown (incl.
+    UEX's own `id_orbit: 0` sentinel for "no parent orbit on record",
+    normalized to `None` at ingestion -- see `backend/ingest/refresh.py`) or
+    for a wiki-only stub terminal with no UEX record at all. Terminals that
+    share an `id_orbit` are the divide-by-zero guard case in CLAUDE.md's
+    edge-weight formula; terminals with `id_orbit is None` simply get no
+    `Distance` rows until their orbit is known."""
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid only
         return f"Terminal(id={self.id!r}, name={self.name!r})"

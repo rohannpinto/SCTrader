@@ -257,6 +257,12 @@ class UexTerminal(BaseModel):
     rather than coerced to `bool` so the distinction between "not modeled in
     pydantic" and "genuinely absent" can't get muddled; callers filter on
     these explicitly.
+
+    `id_orbit` (added for Task 4's distance-expansion algorithm) is present
+    on every real `/terminals` row observed but was omitted from the first
+    pass of this model; the raw value `0` is UEX's documented sentinel for
+    "no parent orbit on record" (e.g. terminal 422, "Admin - UEX Station")
+    -- callers must not treat it as a real orbit id.
     """
 
     model_config = ConfigDict(extra="ignore")
@@ -268,6 +274,7 @@ class UexTerminal(BaseModel):
     displayname: str | None = None
     type: str
     id_star_system: int | None = None
+    id_orbit: int | None = None
     star_system_name: str | None = None
     planet_name: str | None = None
     orbit_name: str | None = None
