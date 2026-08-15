@@ -135,9 +135,16 @@ def test_build_graph_perf_on_large_dataset(engine):
     assert result.graph.number_of_edges() == terminal_count * out_degree
     assert len(result.warnings) == 1  # edge count exceeds the deliberately-low guardrail
 
-    # Generous bound: this is a regression guard against an accidental N+1
-    # query or O(n^2) Python-level loop, not a strict performance SLA.
-    assert elapsed < 15.0, f"build_graph() took {elapsed:.2f}s on a {terminal_count}-terminal dataset"
+    # Regression guard against an accidental N+1 query or O(n^2) Python-level
+    # loop, not a strict performance SLA -- still generous, but tightened from
+    # an earlier 15.0s bound. An independent review measured this build at
+    # ~0.25-0.3s on real hardware; a per-terminal N+1 query pattern (300
+    # queries) still only reached ~0.3s (SQLite's per-query overhead is too
+    # low at this scale for a single N+1 pass to trip a loose bound), but a
+    # severe per-edge N+1 pattern (~36,000 extra queries) reached ~10.7s.
+    # 5.0s (~15-20x the measured baseline) catches that class of regression
+    # while staying safely clear of normal variance on a slower machine.
+    assert elapsed < 5.0, f"build_graph() took {elapsed:.2f}s on a {terminal_count}-terminal dataset"
 
 
 # --- label-setting search: anytime behavior under load -----------------------
