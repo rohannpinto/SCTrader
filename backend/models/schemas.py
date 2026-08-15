@@ -79,11 +79,18 @@ class RouteHop(BaseModel):
 
     terminal_id: int = Field(..., description="Internal Terminal.id of this hop's destination.")
     terminal_name: str = Field(..., description="Human-readable name of this hop's destination.")
-    commodity_id: int = Field(
-        ..., description="Internal Commodity.id of the commodity traded on this hop."
+    commodity_id: int | None = Field(
+        default=None,
+        description=(
+            "Internal Commodity.id of the commodity traded on this hop. `None` for a "
+            "zero-profit \"bridge\" hop where no commodity was profitable on this edge "
+            "(CLAUDE.md's edge-weight formula: the edge still exists and can still be "
+            "worth traversing to reach a profitable edge further along the route)."
+        ),
     )
-    commodity_name: str = Field(
-        ..., description="Human-readable name of the commodity traded on this hop."
+    commodity_name: str | None = Field(
+        default=None,
+        description="Human-readable name of the commodity traded on this hop, or `None` to match `commodity_id`.",
     )
     distance_from_previous: float = Field(
         ..., ge=0, description="In-game distance travelled from the previous hop (or start)."

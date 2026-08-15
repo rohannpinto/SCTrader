@@ -15,6 +15,7 @@ import pytest
 from backend.config import Settings
 from backend.graph.cache import GraphCache, get_graph_cache
 from backend.models.db import (
+    Commodity,
     RefreshRun,
     Terminal,
     create_db_engine,
@@ -155,6 +156,25 @@ def test_previously_held_graph_reference_survives_a_later_rebuild(engine):
     assert new_graph is not old_graph
     assert set(old_graph.nodes) == {1}
     assert set(new_graph.nodes) == {1, 2}
+
+
+# --- commodity display names + atomic snapshot read ---------------------------
+
+
+def test_commodity_names_available_via_snapshot_and_getter(engine):
+    with session_scope(engine) as session:
+        session.add(Commodity(id=1, wiki_uuid="u1", slug="laranite", name="Laranite"))
+
+    cache = GraphCache()
+    snapshot = cache.rebuild(engine=engine, settings=_settings())
+
+    assert snapshot.commodity_names == {1: "Laranite"}
+    assert cache.get_commodity_names() == {1: "Laranite"}
+    assert cache.get_snapshot() is snapshot
+
+    # get_commodity_names() returns a copy, not the live dict.
+    cache.get_commodity_names()[1] = "mutated externally"
+    assert cache.get_commodity_names() == {1: "Laranite"}
 
 
 # --- process-wide singleton accessor ------------------------------------------

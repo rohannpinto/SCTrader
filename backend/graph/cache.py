@@ -69,6 +69,7 @@ class GraphCacheSnapshot:
 
     graph: nx.DiGraph
     data_version: Optional[int]
+    commodity_names: dict[int, str] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
 
 
@@ -85,12 +86,25 @@ class GraphCache:
         # than needing a null check.
         self._snapshot = GraphCacheSnapshot(graph=nx.DiGraph(), data_version=None, warnings=[])
 
+    def get_snapshot(self) -> GraphCacheSnapshot:
+        """Atomic read of graph + data_version + commodity_names + warnings
+        together, for a caller (e.g. a `/route` or `/terminals` router) that
+        needs a mutually consistent view of all of them -- a single
+        attribute read, so it can never straddle a concurrent `rebuild()`
+        the way two independent `get_graph()` / `get_data_version()` calls
+        could.
+        """
+        return self._snapshot
+
     def get_graph(self) -> nx.DiGraph:
         """Instant: returns whatever graph the last successful `rebuild()` produced."""
         return self._snapshot.graph
 
     def get_data_version(self) -> Optional[int]:
         return self._snapshot.data_version
+
+    def get_commodity_names(self) -> dict[int, str]:
+        return dict(self._snapshot.commodity_names)
 
     def get_warnings(self) -> list[str]:
         return list(self._snapshot.warnings)
@@ -113,6 +127,7 @@ class GraphCache:
             snapshot = GraphCacheSnapshot(
                 graph=build_result.graph,
                 data_version=data_version,
+                commodity_names=build_result.commodity_names,
                 warnings=build_result.warnings,
             )
             self._snapshot = snapshot  # atomic swap -- see module docstring

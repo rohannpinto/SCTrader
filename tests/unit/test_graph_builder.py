@@ -323,6 +323,18 @@ def test_no_warning_when_under_guardrail(engine):
     assert result.warnings == []
 
 
+# --- commodity display names --------------------------------------------------
+
+
+def test_commodity_names_are_bulk_loaded_for_display(engine):
+    with session_scope(engine) as session:
+        _seed_two_terminals_and_commodities(session)
+
+    result = build_graph(engine=engine, settings=_settings())
+
+    assert result.commodity_names == {1: "Laranite", 2: "Agricium"}
+
+
 # --- empty DB -----------------------------------------------------------------
 
 
@@ -331,4 +343,5 @@ def test_empty_database_yields_empty_graph(engine):
 
     assert result.graph.number_of_nodes() == 0
     assert result.graph.number_of_edges() == 0
+    assert result.commodity_names == {}
     assert result.warnings == []

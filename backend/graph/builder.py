@@ -90,16 +90,24 @@ import networkx as nx
 from sqlalchemy import Engine, select
 
 from backend.config import Settings, get_settings
-from backend.models.db import Distance, Price, Terminal, session_scope
+from backend.models.db import Commodity, Distance, Price, Terminal, session_scope
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
 class GraphBuildResult:
-    """Return value of `build_graph()`: the graph plus any non-fatal warnings."""
+    """Return value of `build_graph()`: the graph plus any non-fatal warnings.
+
+    `commodity_names` (`Commodity.id -> Commodity.name`) rides alongside the
+    graph so a `/route` router (a later task) can resolve a hop's
+    `best_commodity_id` into a display name entirely from what `GraphCache`
+    already holds -- no separate DB round trip needed on the `/route` hot
+    path just to look up commodity names.
+    """
 
     graph: nx.DiGraph
+    commodity_names: dict[int, str] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
 
 
@@ -109,6 +117,11 @@ def _load_commodity_terminal_ids(session) -> dict[int, Terminal]:
         select(Terminal).where(Terminal.is_commodity_trading.is_(True))
     ).scalars()
     return {row.id: row for row in rows}
+
+
+def _load_commodity_names(session) -> dict[int, str]:
+    """Bulk-load every `Commodity` row as an `id -> name` display lookup."""
+    return {row.id: row.name for row in session.execute(select(Commodity)).scalars()}
 
 
 def _index_prices(
@@ -208,6 +221,7 @@ def build_graph(
             )
 
         buy_prices, sell_prices = _index_prices(session, commodity_terminal_ids)
+        commodity_names = _load_commodity_names(session)
 
         distance_rows = list(session.execute(select(Distance)).scalars())
 
@@ -245,4 +259,4 @@ def build_graph(
         logger.warning(message)
         warnings.append(message)
 
-    return GraphBuildResult(graph=graph, warnings=warnings)
+    return GraphBuildResult(graph=graph, commodity_names=commodity_names, warnings=warnings)
