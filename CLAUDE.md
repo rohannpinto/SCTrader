@@ -475,6 +475,52 @@ shared-context summary.
     (order-of-magnitude bounds, not exact counts — the live catalog can
     drift — plus a hard assertion that `luminalia-gift` specifically stays
     excluded and `laranite` specifically stays included).
+- **Task 18 — zero price means "not traded in this direction," not "priced
+  at zero," confirmed empirically at full scale (2026-08-15):** Task 2's
+  original research established `price_buy`/`price_sell` are "always
+  numeric, never JSON `null`" — true, but incomplete. A live end-to-end
+  `/route` run (Task 17) produced a **$39.7 billion fake-profit route**,
+  traced to `backend/graph/search.py` treating a real, ingested `price_buy
+  == 0.0` as "free to acquire, buy the max cargo allows" — a defensive
+  branch whose own comment called it "extremely unlikely given Task 13's
+  curated commodity set." It is not unlikely; it is the dominant shape of
+  real data. Recomputed the full distribution directly against the live
+  wiki API (not a sample — every row of all 157 allowlisted commodities'
+  price entries, 2004 rows total): **every single row** has *exactly one*
+  of `price_buy`/`price_sell` equal to `0` and the other strictly
+  positive — 1598 rows (79.7%) with `price_buy == 0`, 406 with `price_sell
+  == 0`, **zero** rows with both zero, **zero** rows with both positive.
+  That distribution is only explainable by "0 means this terminal doesn't
+  trade the commodity in this direction" (a buy-only or sell-only
+  terminal still gets a price entry for every commodity, just with the
+  untraded direction reported as a literal `0` rather than the entry
+  being omitted) — consistent with the in-game mechanic that a given
+  terminal trades a given commodity in one direction only.
+  - **Fix, at the ingestion boundary, not the client or the graph/search
+    layers:** `backend/ingest/refresh.py`'s `_normalize_zero_price()`
+    converts a `0`/`0.0` (or already-`None`) `price_buy`/`price_sell` to
+    `None` before it's ever written to the `Price` table, applied
+    independently to both directions. `backend/clients/wiki_client.py`
+    stays a thin, faithful client (still reports the raw literal `0` —
+    that's the API's real behavior, not a bug in the client) and
+    `backend/graph/builder.py`/`search.py`'s existing missing-price
+    exclusion logic needed zero changes, since a genuine `None` in the DB
+    is exactly what that logic already handled correctly — the bug was
+    purely that `0.0` had been reaching that logic instead of `None`.
+  - The "free commodity" branch in `search.py` (`buy_price == 0 → free,
+    use full cargo`) is kept, not deleted — it's provably unreachable via
+    real ingested data now, but still correct, necessary defensive
+    behavior for any direct caller of `find_best_route()` that hands it a
+    literal `0.0` (e.g. a unit test, or a future data source with
+    different semantics).
+  - Verified end to end against live data, not just unit tests: before
+    the fix, `POST /route` for `start_terminal_id=282`
+    (Platinum Bay - Everus Harbor), `ship_id=108` (Caterpillar),
+    `num_hops=4`, `starting_budget=100000` returned
+    `final_cash=39744100000.0`; after the fix, the identical request
+    against freshly-refreshed live data returned `final_cash=657418.0`
+    (`total_profit=557418.0`) — a real, plausible multi-hop trade route
+    through real curated commodities.
 
 ## Standing security ground rules
 

@@ -226,6 +226,15 @@ def test_free_commodity_ignores_cash_uses_full_cargo_capacity():
     # regardless of cash on hand (per spec: division by a non-positive buy
     # price is avoided by definition, not by luck). starting_budget=0.0
     # makes the "cash doesn't gate this" point unambiguous.
+    #
+    # Defensive-code coverage only (Phase 2 Task 18): a literal 0.0 buy
+    # price is provably unreachable via real ingested data as of Task 18
+    # (`backend/ingest/refresh.py`'s `_normalize_zero_price` converts it to
+    # `None`/missing at ingestion time -- see that module's "Zero-price
+    # normalization" docstring section). This test bypasses ingestion
+    # entirely by handing `find_best_route` a `buy_prices` dict with a
+    # literal `0.0` directly, confirming the defensive branch still behaves
+    # correctly for any caller that does the same.
     graph = _graph([(1, 2, 10.0)])
     buy_prices = {1: {1: 0.0}}
     sell_prices = {2: {1: 5.0}}

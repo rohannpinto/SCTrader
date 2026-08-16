@@ -231,8 +231,18 @@ def _best_trade_for_edge(
     never stores a `None`, so "missing" and "priced at 0" can't be
     confused): `quantity = min(floor(cash / buy_price), cargo_capacity)`
     when `buy_price > 0`, else `quantity = cargo_capacity` (a free/
-    zero-or-negative-cost commodity -- extremely unlikely given Task 13's
-    curated commodity set, but handled rather than dividing by zero).
+    zero-or-negative-cost commodity). As of Phase 2 Task 18, this branch is
+    provably unreachable via real ingested data specifically: `backend/
+    ingest/refresh.py`'s `_normalize_zero_price` now normalizes a literal
+    `0` buy/sell price (the wiki API's real signal for "not traded in this
+    direction here", empirically confirmed -- see that module's "Zero-price
+    normalization" docstring section) to `None` at ingestion time, and a
+    `None` price never makes it into `buy_prices`/`sell_prices` at all
+    (`_index_prices`' set-intersection discipline above). This branch is
+    kept anyway, deliberately, as defensive code: any caller that hands
+    `find_best_route` a `buy_prices` dict with a literal `0.0` directly
+    (e.g. a unit test, or a future non-ingestion caller) still gets
+    well-defined, documented behavior rather than a `ZeroDivisionError`.
     `profit = quantity * (sell_price - buy_price)`, only a candidate when
     `sell_price > buy_price` *and* `quantity > 0`. The commodity maximizing
     **total** `profit` wins -- not per-unit margin -- since a cheaper
@@ -264,6 +274,9 @@ def _best_trade_for_edge(
         if buy_price > 0:
             quantity = min(math.floor(cash / buy_price), ship_cargo_capacity_scu)
         else:
+            # Defensive only -- unreachable via real ingested data since
+            # Task 18's ingestion-time zero-price normalization; see this
+            # function's docstring.
             quantity = ship_cargo_capacity_scu  # free/non-positive-cost commodity
 
         if quantity <= 0:

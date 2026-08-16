@@ -275,13 +275,16 @@ def test_full_successful_refresh_counts_and_known_values(engine):
         assert dist.distance == STANTG_LEVSKI_DISTANCE
 
         # A known price from wiki_commodity_laranite.json, exact match.
+        # The real fixture entry's price_buy is a literal 0 (Stanton Gateway
+        # doesn't buy laranite from players) -- Task 18's ingestion-time
+        # zero-price normalization means it lands here as None, not 0.0.
         laranite = session.query(Commodity).filter_by(slug="laranite").one()
         price = (
             session.query(Price)
             .filter_by(terminal_id=stantg.id, commodity_id=laranite.id)
             .one()
         )
-        assert price.price_buy == 0.0
+        assert price.price_buy is None
         assert price.price_sell == 8500.0
         assert price.source_date_updated is not None
 
@@ -454,6 +457,69 @@ def test_missing_price_stays_none_not_coerced_to_zero(engine):
         )
         assert price.price_buy is None
         assert price.price_sell == 8500.0  # untouched field on the same row
+
+
+# --- zero-price normalization (Phase 2 Task 18) --------------------------------
+
+# Real, unmodified entries in `wiki_commodity_laranite.json`:
+# STANTG_ID (802): price_buy=0, price_sell=8500 (Stanton Gateway doesn't buy
+#   laranite from players -- the exact case that produced Task 17's
+#   multi-billion-aUEC "profitable" route bug).
+# ARC_L1_ID (1): price_buy=7400, price_sell=0 (ARC-L1 doesn't sell laranite
+#   to players) -- the reverse case, proving the fix isn't one-sided.
+ARC_L1_ID = 1
+
+
+@respx.mock
+def test_zero_price_normalized_to_none_both_directions(engine):
+    """A literal `0` in the raw wiki response, on either `price_buy` or
+    `price_sell`, must land as `None` in the resulting `Price` row -- not
+    `0.0`, which `backend/graph/search.py`'s cash-aware trade selection
+    would otherwise misread as "free to acquire" / "worthless to sell" (see
+    `backend/ingest/refresh.py::_normalize_zero_price` and its "Zero-price
+    normalization" module docstring section). The real, positive price on
+    the *other* side of each of these same rows must survive untouched --
+    this is a targeted normalization, not a blanket price wipe.
+    """
+    _mock_successful_refresh()
+
+    result = run_refresh(engine=engine, settings=_settings())
+    assert result.status == "success"
+
+    with session_scope(engine) as session:
+        laranite = session.query(Commodity).filter_by(slug="laranite").one()
+
+        stantg = session.query(Terminal).filter_by(uex_terminal_id=STANTG_ID).one()
+        stantg_price = (
+            session.query(Price)
+            .filter_by(terminal_id=stantg.id, commodity_id=laranite.id)
+            .one()
+        )
+        assert stantg_price.price_buy is None  # was a literal 0 in the raw fixture
+        assert stantg_price.price_sell == 8500.0
+
+        arc_l1 = session.query(Terminal).filter_by(uex_terminal_id=ARC_L1_ID).one()
+        arc_l1_price = (
+            session.query(Price)
+            .filter_by(terminal_id=arc_l1.id, commodity_id=laranite.id)
+            .one()
+        )
+        assert arc_l1_price.price_buy == 7400.0
+        assert arc_l1_price.price_sell is None  # was a literal 0 in the raw fixture
+
+
+def test_normalize_zero_price_helper_treats_zero_and_null_identically():
+    """Unit-level check of the helper itself: `0`/`0.0`/`None` all collapse
+    to `None`, a real positive price passes through unchanged. Negative
+    prices don't exist in this domain (never observed, not a case this
+    function needs to special-case) so are deliberately not asserted here.
+    """
+    from backend.ingest.refresh import _normalize_zero_price
+
+    assert _normalize_zero_price(None) is None
+    assert _normalize_zero_price(0) is None
+    assert _normalize_zero_price(0.0) is None
+    assert _normalize_zero_price(7400.0) == 7400.0
 
 
 # --- idempotency --------------------------------------------------------------

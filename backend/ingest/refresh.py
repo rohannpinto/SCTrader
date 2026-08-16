@@ -106,6 +106,40 @@ silently coerced to `0.0`, which would be indistinguishable from a real
 zero-cargo fighter), upsert by `wiki_uuid` (same stable-internal-id pattern
 as `Terminal`/`Commodity`).
 
+Zero-price normalization (Phase 2 Task 18)
+---------------------------------------------
+`WikiPriceEntry.price_buy`/`.price_sell` are "always numeric, never JSON
+`null`" per `wiki_client.py`'s Task 2 research -- but a live end-to-end
+`/route` run (Task 17) surfaced a fact that research never established: a
+literal `0` from the API does not mean "priced at zero", it means "this
+terminal does not trade this commodity in this direction at all" (buy-only
+and sell-only terminals both still get a price entry for every commodity,
+just with the untraded direction reported as `0`, rather than the entry
+being omitted). Confirmed empirically at scale, not assumed: of 2004 real
+`Price` rows in a live-refreshed cache DB, 1598 (80%) had `price_buy ==
+0.0`, and -- checked across every row, not just a sample -- **every single
+row** had *exactly one* of `price_buy`/`price_sell` equal to `0.0` and the
+other strictly positive; zero rows had both zero, zero rows had both
+positive. That distribution is only explainable by "0 means not-offered",
+consistent with the in-game mechanic that a given terminal trades a given
+commodity in one direction only -- never a genuine, intentional zero price
+coexisting with a real trade in the other direction. Spot-checked directly
+against the live API across multiple commodities (`jaclium-ore`,
+`hadanite`, `agricium`, `laranite`, `gold`, `diamond`) with the same
+result every time.
+
+Left uncorrected, this fed `backend/graph/search.py`'s "free commodity"
+branch (`buy_price == 0` treated as "free to acquire, buy the max the
+cargo allows") on 80% of real rows, producing nonsensical multi-billion-
+aUEC "profitable" routes. `_normalize_zero_price` (below) converts a `0`
+(or already-`None`) `price_buy`/`price_sell` to `None` *here*, at the
+ingestion boundary, before it ever reaches `_PriceData`/the `Price` table
+-- not in `wiki_client.py` (a thin client that must keep reporting the
+API's literal value faithfully) and not in `builder.py`/`search.py` (whose
+existing "missing is excluded" set-intersection logic already does the
+right thing with a genuine `None` -- no downstream code needed to change
+at all once the DB itself stops storing a misleading `0.0`).
+
 Commodity curation (Phase 2 Task 13)
 --------------------------------------
 Not every entry the wiki API's `/commodities` catalog returns is a real,
@@ -309,7 +343,16 @@ class _CommodityData:
 
 @dataclass
 class _PriceData:
-    """Desired state for one `Price` row, keyed by (terminal ext id, wiki_uuid)."""
+    """Desired state for one `Price` row, keyed by (terminal ext id, wiki_uuid).
+
+    `price_buy`/`price_sell` have already passed through
+    `_normalize_zero_price` by the time they land here (Phase 2 Task 18) --
+    a literal `0` from the wiki API is normalized to `None` before this
+    dataclass is ever constructed, so every consumer of `_ReconciledData
+    .prices` (including `_replace_prices`, which writes it verbatim to the
+    `Price` table) only ever sees a real, positive price or a genuine
+    `None`. See module docstring's "Zero-price normalization" section.
+    """
 
     price_buy: Optional[float]
     price_sell: Optional[float]
@@ -346,6 +389,21 @@ def _normalize_id_orbit(raw_id_orbit: Optional[int]) -> Optional[int]:
     if raw_id_orbit is None or raw_id_orbit == 0:
         return None
     return raw_id_orbit
+
+
+def _normalize_zero_price(raw_price: Optional[float]) -> Optional[float]:
+    """Normalize a real-but-zero wiki API price to `None` ("missing").
+
+    See module docstring's "Zero-price normalization (Phase 2 Task 18)"
+    section for the full empirical basis: a literal `0` from the wiki API
+    means "not traded in this direction here", functionally identical to a
+    missing price, never a real, usable free/worthless price. Passing an
+    already-`None` value through unchanged keeps this safe to apply
+    unconditionally to every `price_buy`/`price_sell` value at ingestion.
+    """
+    if raw_price is None or raw_price == 0:
+        return None
+    return raw_price
 
 
 def _pick_location_name(terminal: UexTerminal) -> Optional[str]:
@@ -512,8 +570,8 @@ def _reconcile(fetched: _FetchedData, settings: Settings) -> _ReconciledData:
                 )
 
             result.prices[(ext_id, detail.uuid)] = _PriceData(
-                price_buy=entry.price_buy,
-                price_sell=entry.price_sell,
+                price_buy=_normalize_zero_price(entry.price_buy),
+                price_sell=_normalize_zero_price(entry.price_sell),
                 source_date_updated=entry.date_updated,
             )
 
