@@ -196,36 +196,116 @@ def test_ships_reflects_null_manufacturer(client, engine):
 # --- /route: validation ----------------------------------------------------------
 
 
+def _seed_ship(engine, **overrides) -> None:
+    defaults = dict(
+        id=1,
+        wiki_uuid="uuid-test-ship",
+        name="Test Ship",
+        manufacturer_name="Test Manufacturer",
+        quantum_range_gm=1000.0,
+        cargo_capacity_scu=100.0,
+    )
+    defaults.update(overrides)
+    with session_scope(engine) as session:
+        session.add(Ship(**defaults))
+
+
+def _valid_route_payload(**overrides) -> dict:
+    payload = {"start_terminal_id": 1, "ship_id": 1, "num_hops": 5, "starting_budget": 1000.0}
+    payload.update(overrides)
+    return payload
+
+
 def test_route_unknown_start_terminal_returns_404(client):
-    response = client.post("/route", json={"start_terminal_id": 999, "max_distance": 100.0})
+    # No terminal seeded at all -- the graph cache pre-warms empty, so
+    # start_terminal_id=999 is unknown regardless of ship_id/num_hops/
+    # starting_budget (which are otherwise schema-valid).
+    response = client.post("/route", json=_valid_route_payload(start_terminal_id=999))
     assert response.status_code == 404
 
 
-def test_route_max_distance_exceeding_cap_returns_422(client, engine):
+def test_route_unknown_ship_returns_404(client, engine):
     with session_scope(engine) as session:
         session.add(Terminal(id=1, name="A", is_commodity_trading=True))
     get_graph_cache().rebuild(engine=engine)
 
-    response = client.post(
-        "/route", json={"start_terminal_id": 1, "max_distance": 10_000_000.0}
-    )
-    assert response.status_code == 422
+    # No Ship row seeded at all -- ship_id=1 must 404, same pattern as an
+    # unknown start_terminal_id (CLAUDE.md security ground rules).
+    response = client.post("/route", json=_valid_route_payload())
+    assert response.status_code == 404
 
 
-def test_route_distance_threshold_exceeding_cap_returns_422(client, engine):
+def test_route_num_hops_exceeding_cap_returns_422(client, engine):
+    from backend.config import get_settings
+
     with session_scope(engine) as session:
         session.add(Terminal(id=1, name="A", is_commodity_trading=True))
+    _seed_ship(engine)
     get_graph_cache().rebuild(engine=engine)
 
     response = client.post(
         "/route",
-        json={"start_terminal_id": 1, "max_distance": 100.0, "distance_threshold": 10_000_000.0},
+        json=_valid_route_payload(num_hops=get_settings().max_hops_cap + 1),
     )
     assert response.status_code == 422
 
 
-def test_route_non_positive_max_distance_rejected_by_schema(client):
-    response = client.post("/route", json={"start_terminal_id": 1, "max_distance": 0.0})
+def test_route_starting_budget_exceeding_cap_returns_422(client, engine):
+    from backend.config import get_settings
+
+    with session_scope(engine) as session:
+        session.add(Terminal(id=1, name="A", is_commodity_trading=True))
+    _seed_ship(engine)
+    get_graph_cache().rebuild(engine=engine)
+
+    response = client.post(
+        "/route",
+        json=_valid_route_payload(starting_budget=get_settings().max_starting_budget_cap + 1.0),
+    )
+    assert response.status_code == 422
+
+
+def test_route_non_positive_num_hops_rejected_by_schema(client):
+    response = client.post("/route", json=_valid_route_payload(num_hops=0))
+    assert response.status_code == 422
+
+    response = client.post("/route", json=_valid_route_payload(num_hops=-3))
+    assert response.status_code == 422
+
+
+def test_route_negative_starting_budget_rejected_by_schema(client):
+    response = client.post("/route", json=_valid_route_payload(starting_budget=-1.0))
+    assert response.status_code == 422
+
+
+# --- /route: adversarial/malformed input never 500s --------------------------------
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"start_terminal_id": "not-an-int"},
+        {"ship_id": "not-an-int"},
+        {"ship_id": None},
+        {"num_hops": "not-an-int"},
+        {"num_hops": 5.5},
+        {"num_hops": -1_000_000},
+        {"starting_budget": "not-a-float"},
+        {"starting_budget": -1e30},
+        {"num_hops": 10**18},
+        {"starting_budget": 1e30},
+    ],
+)
+def test_route_malformed_or_adversarial_input_returns_clean_4xx_not_500(client, overrides):
+    response = client.post("/route", json=_valid_route_payload(**overrides))
+    assert 400 <= response.status_code < 500
+
+
+@pytest.mark.parametrize("field", ["start_terminal_id", "ship_id", "num_hops", "starting_budget"])
+def test_route_missing_required_field_returns_422(client, field):
+    payload = _valid_route_payload()
+    del payload[field]
+    response = client.post("/route", json=payload)
     assert response.status_code == 422
 
 
@@ -237,47 +317,29 @@ def _seed_isolated_terminal(engine):
         session.add(Terminal(id=1, name="Lonely Outpost", is_commodity_trading=True))
 
 
-@pytest.mark.skip(
-    reason=(
-        "Phase 2 Task 14 replaced backend/graph/search.py's find_best_route() "
-        "signature (hop-count/cash/cargo, no more max_distance/distance_threshold) "
-        "as designed -- backend/routers/route.py and backend/models/schemas.py's "
-        "RouteRequest/RouteHop/RouteResponse still speak the old contract and are "
-        "explicitly Task 15's job ('Schemas + routers') to rewire, per the approved "
-        "plan's Phase 2 task list. Skipped rather than deleted so Task 15 has the "
-        "old expected shape to rewrite against; will be replaced with new-contract "
-        "assertions once /route is reworked."
-    )
-)
 def test_route_isolated_terminal_returns_found_false(client, engine):
     _seed_isolated_terminal(engine)
+    _seed_ship(engine)
     get_graph_cache().rebuild(engine=engine)
 
-    response = client.post("/route", json={"start_terminal_id": 1, "max_distance": 100.0})
+    response = client.post("/route", json=_valid_route_payload())
     assert response.status_code == 200
     body = response.json()
     assert body["found"] is False
     assert body["hops"] == []
     assert body["total_distance"] == 0.0
     assert body["total_profit"] == 0.0
+    assert body["starting_budget"] == 1000.0
+    assert body["final_cash"] == 1000.0
     assert body["message"]
 
 
-@pytest.mark.skip(
-    reason=(
-        "Phase 2 Task 14 replaced find_best_route()'s signature/semantics (real "
-        "cash-scaled profit, not a per-unit rate) -- see the skip reason on "
-        "test_route_isolated_terminal_returns_found_false just above. Task 15 "
-        "owns rewiring backend/routers/route.py to the new algorithm and rewriting "
-        "this test's expectations against real ship_id/num_hops/starting_budget "
-        "request fields."
-    )
-)
 def test_route_profitable_edge_returns_found_true_with_resolved_names(client, engine):
     with session_scope(engine) as session:
         session.add(Terminal(id=1, name="A", is_commodity_trading=True))
         session.add(Terminal(id=2, name="B", is_commodity_trading=True))
         session.add(Commodity(id=1, wiki_uuid="u1", slug="laranite", name="Laranite"))
+    _seed_ship(engine, quantum_range_gm=1000.0, cargo_capacity_scu=100.0)
 
     with session_scope(engine) as session:
         session.add(Distance(terminal_a_id=1, terminal_b_id=2, distance=10.0, fetched_at=_now()))
@@ -290,13 +352,17 @@ def test_route_profitable_edge_returns_found_true_with_resolved_names(client, en
 
     get_graph_cache().rebuild(engine=engine)
 
-    response = client.post("/route", json={"start_terminal_id": 1, "max_distance": 100.0})
+    # cash=1000, buy=100 -> qty=min(floor(1000/100)=10, cargo=100)=10
+    # profit = 10 * (200-100) = 1000 -> final_cash = 2000
+    response = client.post("/route", json=_valid_route_payload(num_hops=1, starting_budget=1000.0))
     assert response.status_code == 200
     body = response.json()
     assert body["found"] is True
     assert body["start_terminal_id"] == 1
     assert body["total_distance"] == 10.0
-    assert body["total_profit"] == 100.0
+    assert body["starting_budget"] == 1000.0
+    assert body["final_cash"] == 2000.0
+    assert body["total_profit"] == 1000.0
     assert body["hops"] == [
         {
             "terminal_id": 2,
@@ -304,9 +370,86 @@ def test_route_profitable_edge_returns_found_true_with_resolved_names(client, en
             "commodity_id": 1,
             "commodity_name": "Laranite",
             "distance_from_previous": 10.0,
-            "profit_this_hop": 100.0,
+            "quantity_traded": 10.0,
+            "unit_buy_price": 100.0,
+            "unit_sell_price": 200.0,
+            "profit_this_hop": 1000.0,
         }
     ]
+
+
+def test_route_ship_jump_range_filters_out_too_far_edge(client, engine):
+    # Same profitable edge as above, but the selected ship's quantum range
+    # (5.0 Gm) is shorter than the edge's distance (10.0 Gm) -- the hop must
+    # never be taken, so no route is found.
+    with session_scope(engine) as session:
+        session.add(Terminal(id=1, name="A", is_commodity_trading=True))
+        session.add(Terminal(id=2, name="B", is_commodity_trading=True))
+        session.add(Commodity(id=1, wiki_uuid="u1", slug="laranite", name="Laranite"))
+    _seed_ship(engine, quantum_range_gm=5.0, cargo_capacity_scu=100.0)
+
+    with session_scope(engine) as session:
+        session.add(Distance(terminal_a_id=1, terminal_b_id=2, distance=10.0, fetched_at=_now()))
+        session.add(
+            Price(terminal_id=1, commodity_id=1, price_buy=100.0, price_sell=None, fetched_at=_now())
+        )
+        session.add(
+            Price(terminal_id=2, commodity_id=1, price_buy=None, price_sell=200.0, fetched_at=_now())
+        )
+
+    get_graph_cache().rebuild(engine=engine)
+
+    response = client.post("/route", json=_valid_route_payload(num_hops=1, starting_budget=1000.0))
+    assert response.status_code == 200
+    body = response.json()
+    assert body["found"] is False
+    assert body["final_cash"] == 1000.0
+
+
+def test_route_multi_hop_realistic_search_produces_sane_final_cash(client, engine):
+    # Chain A -> B -> C, both hops profitable via the same commodity, cargo
+    # capped at 5 SCU so the arithmetic is easy to hand-verify (same shape
+    # as tests/unit/test_search.py::test_num_hops_bounds_route_length):
+    #   hop1 (A->B): cash=100 -> qty=min(floor(100/10)=10, 5)=5 -> profit 50 -> cash=150
+    #   hop2 (B->C): cash=150 -> qty=min(floor(150/10)=15, 5)=5 -> profit 50 -> cash=200
+    with session_scope(engine) as session:
+        session.add(Terminal(id=1, name="A", is_commodity_trading=True))
+        session.add(Terminal(id=2, name="B", is_commodity_trading=True))
+        session.add(Terminal(id=3, name="C", is_commodity_trading=True))
+        session.add(Commodity(id=1, wiki_uuid="u1", slug="laranite", name="Laranite"))
+    _seed_ship(engine, quantum_range_gm=50.0, cargo_capacity_scu=5.0)
+
+    with session_scope(engine) as session:
+        session.add(Distance(terminal_a_id=1, terminal_b_id=2, distance=10.0, fetched_at=_now()))
+        session.add(Distance(terminal_a_id=2, terminal_b_id=3, distance=10.0, fetched_at=_now()))
+        session.add(
+            Price(terminal_id=1, commodity_id=1, price_buy=10.0, price_sell=None, fetched_at=_now())
+        )
+        session.add(
+            Price(terminal_id=2, commodity_id=1, price_buy=10.0, price_sell=20.0, fetched_at=_now())
+        )
+        session.add(
+            Price(terminal_id=3, commodity_id=1, price_buy=None, price_sell=20.0, fetched_at=_now())
+        )
+
+    get_graph_cache().rebuild(engine=engine)
+
+    response = client.post(
+        "/route", json=_valid_route_payload(num_hops=2, starting_budget=100.0)
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["found"] is True
+    assert body["start_terminal_id"] == 1
+    assert len(body["hops"]) == 2
+    assert [hop["terminal_id"] for hop in body["hops"]] == [2, 3]
+    assert body["total_distance"] == 20.0
+    assert body["starting_budget"] == 100.0
+    assert body["final_cash"] == 200.0
+    assert body["total_profit"] == 100.0
+    for hop in body["hops"]:
+        assert hop["quantity_traded"] == 5.0
+        assert hop["profit_this_hop"] == 50.0
 
 
 # --- /refresh-status --------------------------------------------------------------

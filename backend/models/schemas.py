@@ -8,15 +8,16 @@ These models are intentionally decoupled from the SQLAlchemy models in
 per CLAUDE.md's security ground rules ("all user-facing input must be
 validated server-side with explicit bounds").
 
-Note: server-side caps (e.g. `distance_threshold_max`, `max_distance_cap`
-from `backend.config.Settings`) and existence checks (e.g. "does this
-`start_terminal_id` actually exist") are enforced by the routers that use
-these models, not here -- these models only enforce shape/type/sign
+Note: server-side caps (e.g. `max_hops_cap`, `max_starting_budget_cap` from
+`backend.config.Settings`) and existence checks (e.g. "does this
+`start_terminal_id`/`ship_id` actually exist") are enforced by the routers
+that use these models, not here -- these models only enforce shape/type/sign
 constraints that hold true regardless of runtime config.
 """
 
 from __future__ import annotations
 
+import math
 from datetime import datetime
 from typing import Literal
 
@@ -68,33 +69,46 @@ class ShipOut(BaseModel):
 
 
 class RouteRequest(BaseModel):
-    """A request to search for a profitable trading route from a starting terminal."""
+    """A request to search for a profitable trading route from a starting
+    terminal (Phase 2: hop-count/cash/cargo model -- see CLAUDE.md's "Route
+    search problem"). `max_distance`/`distance_threshold` no longer exist as
+    concepts anywhere in this app; the selected ship's quantum range gates
+    per-hop traversal instead (resolved server-side from `ship_id`, not a
+    request field)."""
 
     start_terminal_id: int = Field(
         ..., description="Internal Terminal.id to start the route search from."
     )
-    max_distance: float = Field(
+    ship_id: int = Field(
+        ...,
+        description=(
+            "Internal Ship.id of the ship to use for this search -- its "
+            "quantum_range_gm gates per-hop traversal and its "
+            "cargo_capacity_scu caps per-hop trade quantity."
+        ),
+    )
+    num_hops: int = Field(
         ...,
         gt=0,
         description=(
-            "Total in-game distance budget for the route search. Must be "
-            "positive; also capped server-side at `settings.max_distance_cap`."
+            "Maximum number of hops the route search may take. Must be "
+            "positive; also capped server-side at `settings.max_hops_cap`."
         ),
     )
-    distance_threshold: float | None = Field(
-        default=None,
-        gt=0,
+    starting_budget: float = Field(
+        ...,
+        ge=0,
         description=(
-            "Optional per-request override of the server's default max "
-            "edge distance (`settings.distance_threshold_default`). Must "
-            "be positive if provided; also capped server-side at "
-            "`settings.distance_threshold_max`."
+            "Cash (aUEC) on hand at the start of the search. Must be "
+            "non-negative; also capped server-side at "
+            "`settings.max_starting_budget_cap`."
         ),
     )
 
 
 class RouteHop(BaseModel):
-    """A single leg of a found route: travel to a terminal and trade a commodity there."""
+    """A single leg of a found route: travel to a terminal and (optionally)
+    trade a commodity there."""
 
     terminal_id: int = Field(..., description="Internal Terminal.id of this hop's destination.")
     terminal_name: str = Field(..., description="Human-readable name of this hop's destination.")
@@ -102,9 +116,10 @@ class RouteHop(BaseModel):
         default=None,
         description=(
             "Internal Commodity.id of the commodity traded on this hop. `None` for a "
-            "zero-profit \"bridge\" hop where no commodity was profitable on this edge "
-            "(CLAUDE.md's edge-weight formula: the edge still exists and can still be "
-            "worth traversing to reach a profitable edge further along the route)."
+            "neutral \"bridge\" hop where no commodity was profitable given the cash on "
+            "hand at this hop's origin (CLAUDE.md's Phase 2 search model: the edge still "
+            "exists and can still be worth traversing to reach a profitable edge further "
+            "along the route)."
         ),
     )
     commodity_name: str | None = Field(
@@ -114,8 +129,26 @@ class RouteHop(BaseModel):
     distance_from_previous: float = Field(
         ..., ge=0, description="In-game distance travelled from the previous hop (or start)."
     )
+    quantity_traded: float = Field(
+        ...,
+        ge=0,
+        description="Units of the commodity bought/sold on this hop (0 for a bridge hop).",
+    )
+    unit_buy_price: float | None = Field(
+        default=None,
+        description="Per-unit buy price at this hop's origin, or `None` for a bridge hop.",
+    )
+    unit_sell_price: float | None = Field(
+        default=None,
+        description="Per-unit sell price at this hop's destination, or `None` for a bridge hop.",
+    )
     profit_this_hop: float = Field(
-        ..., ge=0, description="Profit realized by buying/selling on this hop's edge."
+        ...,
+        ge=0,
+        description=(
+            "Real, absolute aUEC profit realized on this hop "
+            "(quantity_traded * (unit_sell_price - unit_buy_price)), 0.0 for a bridge hop."
+        ),
     )
 
 
@@ -126,13 +159,17 @@ class RouteResponse(BaseModel):
     `found` flag:
 
     - `found=True`: `hops` is a non-empty ordered list of `RouteHop`,
-      `total_distance` and `total_profit` summarize the whole route.
+      `final_cash` is strictly greater than `starting_budget` (CLAUDE.md's
+      Phase 2 "found" definition -- real, positive realized profit, not
+      merely "didn't lose money"), and `total_distance`/`total_profit`
+      summarize the whole route.
     - `found=False`: no profitable route existed from `start_terminal_id`
       under the given constraints (including the "isolated start node, zero
       viable outgoing edges" case from CLAUDE.md). This is a normal,
       successful response -- not an error -- so `hops` is an empty list,
-      `total_distance`/`total_profit` are `0.0`, and `message` carries a
-      human-readable explanation for direct display.
+      `final_cash` equals `starting_budget`, `total_distance`/`total_profit`
+      are `0.0`, and `message` carries a human-readable explanation for
+      direct display.
 
     Callers should branch on `found`, never infer it from `hops` being
     empty (kept consistent by construction, but `found` is the contract).
@@ -144,10 +181,25 @@ class RouteResponse(BaseModel):
         default_factory=list, description="Ordered route legs; empty when `found` is False."
     )
     total_distance: float = Field(
-        default=0.0, ge=0, description="Sum of `distance_from_previous` across all hops."
+        default=0.0,
+        ge=0,
+        description="Sum of `distance_from_previous` across all hops. Informational only -- no longer a search constraint.",
+    )
+    starting_budget: float = Field(
+        ..., ge=0, description="Cash (aUEC) on hand at the start of the search -- echoes the request."
+    )
+    final_cash: float = Field(
+        ...,
+        ge=0,
+        description=(
+            "Cash (aUEC) on hand at the end of the best route found. Equals "
+            "`starting_budget` when `found` is False."
+        ),
     )
     total_profit: float = Field(
-        default=0.0, ge=0, description="Sum of `profit_this_hop` across all hops."
+        default=0.0,
+        ge=0,
+        description="Net profit realized: `final_cash - starting_budget`.",
     )
     message: str | None = Field(
         default=None,
@@ -169,6 +221,24 @@ class RouteResponse(BaseModel):
             raise ValueError("RouteResponse: `found=True` requires a non-empty `hops` list.")
         if not self.found and self.hops:
             raise ValueError("RouteResponse: `found=False` requires an empty `hops` list.")
+        return self
+
+    @model_validator(mode="after")
+    def _check_total_profit_matches_cash_delta(self) -> "RouteResponse":
+        """Enforce `total_profit == final_cash - starting_budget` (CLAUDE.md/
+        Task 15: "total_profit is final_cash - starting_budget") -- the same
+        "don't just trust convention, check it at construction time" spirit
+        as the found/hops invariant above. `math.isclose` (not exact `==`)
+        purely to tolerate ordinary floating-point summation noise, not to
+        allow any real drift.
+        """
+        expected = self.final_cash - self.starting_budget
+        if not math.isclose(self.total_profit, expected, rel_tol=1e-9, abs_tol=1e-9):
+            raise ValueError(
+                "RouteResponse: `total_profit` must equal `final_cash - starting_budget` "
+                f"(got total_profit={self.total_profit!r}, "
+                f"final_cash - starting_budget={expected!r})."
+            )
         return self
 
 

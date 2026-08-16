@@ -48,29 +48,29 @@ def test_terminal_out_from_attributes():
 
 
 def test_route_request_accepts_valid_input():
-    req = RouteRequest(start_terminal_id=1, max_distance=1000.0)
-    assert req.distance_threshold is None
+    req = RouteRequest(start_terminal_id=1, ship_id=2, num_hops=5, starting_budget=1000.0)
+    assert req.start_terminal_id == 1
+    assert req.ship_id == 2
+    assert req.num_hops == 5
+    assert req.starting_budget == 1000.0
 
 
-def test_route_request_rejects_non_positive_max_distance():
+def test_route_request_rejects_non_positive_num_hops():
     with pytest.raises(ValidationError):
-        RouteRequest(start_terminal_id=1, max_distance=0)
-
-    with pytest.raises(ValidationError):
-        RouteRequest(start_terminal_id=1, max_distance=-5.0)
-
-
-def test_route_request_rejects_non_positive_distance_threshold_when_provided():
-    with pytest.raises(ValidationError):
-        RouteRequest(start_terminal_id=1, max_distance=1000.0, distance_threshold=0)
+        RouteRequest(start_terminal_id=1, ship_id=1, num_hops=0, starting_budget=1000.0)
 
     with pytest.raises(ValidationError):
-        RouteRequest(start_terminal_id=1, max_distance=1000.0, distance_threshold=-1.0)
+        RouteRequest(start_terminal_id=1, ship_id=1, num_hops=-3, starting_budget=1000.0)
 
 
-def test_route_request_accepts_positive_distance_threshold_override():
-    req = RouteRequest(start_terminal_id=1, max_distance=1000.0, distance_threshold=5000.0)
-    assert req.distance_threshold == 5000.0
+def test_route_request_rejects_negative_starting_budget():
+    with pytest.raises(ValidationError):
+        RouteRequest(start_terminal_id=1, ship_id=1, num_hops=5, starting_budget=-1.0)
+
+
+def test_route_request_accepts_zero_starting_budget():
+    req = RouteRequest(start_terminal_id=1, ship_id=1, num_hops=5, starting_budget=0.0)
+    assert req.starting_budget == 0.0
 
 
 # --- RouteHop / RouteResponse -----------------------------------------------
@@ -83,18 +83,53 @@ def _sample_hop(**overrides) -> RouteHop:
         commodity_id=1,
         commodity_name="Laranite",
         distance_from_previous=1234.5,
-        profit_this_hop=42.0,
+        quantity_traded=10.0,
+        unit_buy_price=100.0,
+        unit_sell_price=150.0,
+        profit_this_hop=500.0,
     )
     defaults.update(overrides)
     return RouteHop(**defaults)
 
 
-def test_route_hop_rejects_negative_distance_and_profit():
+def _sample_bridge_hop(**overrides) -> RouteHop:
+    """A neutral bridge hop -- no commodity traded, matches
+    `backend/graph/search.py`'s `RouteHopResult` shape for a hop where
+    `commodity_id is None`."""
+    defaults = dict(
+        terminal_id=3,
+        terminal_name="Terminal C",
+        commodity_id=None,
+        commodity_name=None,
+        distance_from_previous=50.0,
+        quantity_traded=0.0,
+        unit_buy_price=None,
+        unit_sell_price=None,
+        profit_this_hop=0.0,
+    )
+    defaults.update(overrides)
+    return RouteHop(**defaults)
+
+
+def test_route_hop_rejects_negative_distance_profit_and_quantity():
     with pytest.raises(ValidationError):
         _sample_hop(distance_from_previous=-1.0)
 
     with pytest.raises(ValidationError):
         _sample_hop(profit_this_hop=-1.0)
+
+    with pytest.raises(ValidationError):
+        _sample_hop(quantity_traded=-1.0)
+
+
+def test_route_hop_allows_none_commodity_and_prices_for_bridge_hop():
+    hop = _sample_bridge_hop()
+    assert hop.commodity_id is None
+    assert hop.commodity_name is None
+    assert hop.unit_buy_price is None
+    assert hop.unit_sell_price is None
+    assert hop.quantity_traded == 0.0
+    assert hop.profit_this_hop == 0.0
 
 
 def test_route_response_found_case_round_trips():
@@ -104,7 +139,9 @@ def test_route_response_found_case_round_trips():
         start_terminal_id=1,
         hops=[hop],
         total_distance=1234.5,
-        total_profit=42.0,
+        starting_budget=1000.0,
+        final_cash=1500.0,
+        total_profit=500.0,
     )
     dumped = response.model_dump()
     reloaded = RouteResponse.model_validate(dumped)
@@ -117,12 +154,15 @@ def test_route_response_not_found_case_is_unambiguous():
     response = RouteResponse(
         start_terminal_id=1,
         found=False,
+        starting_budget=1000.0,
+        final_cash=1000.0,
         message="No profitable route found from this start terminal.",
     )
     assert response.found is False
     assert response.hops == []
     assert response.total_distance == 0.0
     assert response.total_profit == 0.0
+    assert response.final_cash == response.starting_budget
 
     dumped = response.model_dump()
     reloaded = RouteResponse.model_validate(dumped)
@@ -131,8 +171,17 @@ def test_route_response_not_found_case_is_unambiguous():
 
 
 def test_route_response_found_and_not_found_are_distinguishable_by_flag_alone():
-    found = RouteResponse(start_terminal_id=1, found=True, hops=[_sample_hop()])
-    not_found = RouteResponse(start_terminal_id=1, found=False)
+    found = RouteResponse(
+        start_terminal_id=1,
+        found=True,
+        hops=[_sample_hop()],
+        starting_budget=1000.0,
+        final_cash=1500.0,
+        total_profit=500.0,
+    )
+    not_found = RouteResponse(
+        start_terminal_id=1, found=False, starting_budget=1000.0, final_cash=1000.0
+    )
     assert found.found != not_found.found
     # `found` is the contract -- not merely inferred from `hops` emptiness.
     assert (len(found.hops) > 0) == found.found
@@ -141,22 +190,74 @@ def test_route_response_found_and_not_found_are_distinguishable_by_flag_alone():
 
 def test_route_response_rejects_found_true_with_empty_hops():
     with pytest.raises(ValidationError):
-        RouteResponse(start_terminal_id=1, found=True, hops=[])
+        RouteResponse(
+            start_terminal_id=1, found=True, hops=[], starting_budget=1000.0, final_cash=1000.0
+        )
 
 
 def test_route_response_rejects_found_false_with_nonempty_hops():
     with pytest.raises(ValidationError):
-        RouteResponse(start_terminal_id=1, found=False, hops=[_sample_hop()])
+        RouteResponse(
+            start_terminal_id=1,
+            found=False,
+            hops=[_sample_hop()],
+            starting_budget=1000.0,
+            final_cash=1500.0,
+            total_profit=500.0,
+        )
 
 
 def test_route_response_accepts_found_true_with_hops_and_found_false_with_empty_hops():
-    found = RouteResponse(start_terminal_id=1, found=True, hops=[_sample_hop()])
+    found = RouteResponse(
+        start_terminal_id=1,
+        found=True,
+        hops=[_sample_hop()],
+        starting_budget=1000.0,
+        final_cash=1500.0,
+        total_profit=500.0,
+    )
     assert found.found is True
     assert len(found.hops) == 1
 
-    not_found = RouteResponse(start_terminal_id=1, found=False, hops=[])
+    not_found = RouteResponse(
+        start_terminal_id=1, found=False, hops=[], starting_budget=1000.0, final_cash=1000.0
+    )
     assert not_found.found is False
     assert not_found.hops == []
+
+
+# --- RouteResponse: total_profit == final_cash - starting_budget invariant --
+
+
+def test_route_response_defaults_total_profit_to_zero_when_cash_unchanged():
+    response = RouteResponse(
+        start_terminal_id=1, found=False, starting_budget=1000.0, final_cash=1000.0
+    )
+    assert response.total_profit == 0.0
+
+
+def test_route_response_rejects_total_profit_inconsistent_with_cash_delta():
+    with pytest.raises(ValidationError):
+        RouteResponse(
+            start_terminal_id=1,
+            found=True,
+            hops=[_sample_hop()],
+            starting_budget=1000.0,
+            final_cash=1500.0,
+            total_profit=999.0,  # should be 500.0 (final_cash - starting_budget)
+        )
+
+
+def test_route_response_accepts_total_profit_matching_cash_delta():
+    response = RouteResponse(
+        start_terminal_id=1,
+        found=True,
+        hops=[_sample_hop()],
+        starting_budget=1000.0,
+        final_cash=1500.0,
+        total_profit=500.0,
+    )
+    assert response.total_profit == 500.0
 
 
 # --- RefreshStatusOut --------------------------------------------------------

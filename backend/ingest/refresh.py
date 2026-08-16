@@ -59,8 +59,11 @@ trade graph), then:
   directional/asymmetric for a handful of real pairs (see `uex_client.py`).
 - For every *ordered* pair of distinct commodity-trading terminals that
   share the same `id_orbit`, emits a `Distance` row floored at
-  `settings.min_distance_floor` -- the divide-by-zero guard from CLAUDE.md's
-  edge-weight formula, computed once here at ingestion time.
+  `settings.min_distance_floor` -- gives same-orbit pairs a sensible
+  nonzero distance value, computed once here at ingestion time. (Phase 1
+  used this to guard a divide-by-zero in the edge-weight formula; Phase 2
+  removed that formula, but the same-orbit floor is still the right thing
+  to store.)
 - A terminal with `id_orbit is None` (unknown orbit, or the stub-terminal
   case above) simply never appears in the orbit map, so it gets no
   `Distance` rows at all -- expected and fine.

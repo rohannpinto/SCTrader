@@ -46,9 +46,22 @@ class Settings(BaseSettings):
     refresh_token: str | None = None
 
     # --- Route search / graph thresholds ---
-    distance_threshold_default: float = 20000.0
-    distance_threshold_max: float = 100000.0
-    max_distance_cap: float = 500000.0
+    # Phase 2: the continuous distance-budget model (distance_threshold_default/
+    # _max, max_distance_cap) is retired -- a route's per-hop distance filter is
+    # now the *selected ship's* quantum_range_gm (resolved server-side from
+    # ship_id), not a client-supplied distance parameter. See CLAUDE.md's "Route
+    # search problem" section.
+    max_hops_cap: int = 50
+    """Server-side cap on `RouteRequest.num_hops`, enforced regardless of what
+    the client claims (CLAUDE.md's security ground rules). The Phase 2 DP's
+    state space is `O(nodes * num_hops)`, already small and exactly bounded --
+    this cap exists to bound worst-case latency/memory on a request, not
+    because the algorithm needs it to terminate."""
+    max_starting_budget_cap: float = 100_000_000.0
+    """Server-side cap on `RouteRequest.starting_budget` (aUEC), enforced
+    regardless of what the client claims. Generous relative to realistic
+    in-game cash balances -- exists purely as a sane upper bound against
+    malformed/adversarial input, not a realistic gameplay limit."""
     min_distance_floor: float = 1.0
 
     # --- Storage ---
@@ -68,7 +81,6 @@ class Settings(BaseSettings):
 
     # --- Graph build / search safety valves ---
     graph_edge_count_guardrail: int = 50000
-    search_label_cap_per_node: int = 50
     search_time_budget_seconds: float = 2.0
 
 

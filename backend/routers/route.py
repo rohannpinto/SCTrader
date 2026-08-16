@@ -1,18 +1,24 @@
-"""`POST /route` -- searches for the profit-maximizing walk from a starting
-terminal, subject to a distance budget.
+"""`POST /route` -- searches for the walk of at most `num_hops` hops from a
+starting terminal that maximizes final cash on hand, given a selected ship's
+quantum range (per-hop distance filter) and cargo capacity (per-hop quantity
+cap) and a starting cash balance (Phase 2 hop-count/cash/cargo model -- see
+CLAUDE.md's "Route search problem").
 
 The actual algorithm lives entirely in `backend/graph/search.py`; this
-router's job is request validation (CLAUDE.md's security ground rules),
-resolving `distance_threshold`'s default/cap from settings, a small
-self-invalidating LRU cache in front of the (not-cheap-on-a-dense-graph)
-search, and translating the low-level `RouteSearchResult` into the API's
-`RouteResponse` shape (filling in display names the search layer
-deliberately has no knowledge of).
+router's job is request validation (CLAUDE.md's security ground rules --
+`start_terminal_id` and `ship_id` checked against real known
+terminals/ships, `num_hops`/`starting_budget` capped server-side regardless
+of client input), resolving the selected ship's `quantum_range_gm`/
+`cargo_capacity_scu`, a small self-invalidating cache in front of the
+(not-cheap-on-a-dense-graph) search, and translating the low-level
+`RouteSearchResult` into the API's `RouteResponse` shape (filling in display
+names the search layer deliberately has no knowledge of).
 """
 
 from __future__ import annotations
 
-import functools
+import threading
+from collections import OrderedDict
 
 import networkx as nx
 from fastapi import APIRouter, HTTPException, Request
@@ -20,47 +26,100 @@ from fastapi import APIRouter, HTTPException, Request
 from backend.config import get_settings
 from backend.graph.cache import get_graph_cache
 from backend.graph.search import RouteSearchResult, find_best_route
+from backend.models.db import Ship, session_scope
 from backend.models.schemas import RouteHop, RouteRequest, RouteResponse
 from backend.rate_limit import limiter
 
 router = APIRouter()
 
-#: Bounds memory for the LRU cache below; old entries (superseded data
+#: Bounds memory for the cache below; old entries (superseded data
 #: versions, or just unpopular queries) age out under this cap.
 _ROUTE_CACHE_MAXSIZE = 256
 
+#: CLAUDE.md's `/route` cache key is `(start_terminal_id, ship_id, num_hops,
+#: starting_budget, cache_data_version)`. Implemented as a small hand-rolled
+#: LRU (an `OrderedDict` + lock) rather than `functools.lru_cache`, because
+#: `find_best_route()` needs the *actual* `buy_prices`/`sell_prices` dicts to
+#: run -- and plain `dict`s are unhashable, so they can never be part of an
+#: `lru_cache`-decorated function's argument list (it hashes every argument
+#: to build the cache key). `graph` rides along as an extra key component --
+#: hashed/compared by object identity, like any plain Python object
+#: (`networkx.Graph` defines no custom `__eq__`/`__hash__`) -- for the same
+#: reason Phase 1's version of this cache did: it pins the lookup to the
+#: *exact* graph/price-index snapshot the caller already validated
+#: `start_terminal_id` against, rather than re-fetching
+#: `get_graph_cache().get_snapshot()` in here and risking it having raced
+#: ahead to a newer `rebuild()` in between (which would compute against the
+#: new snapshot while getting cached under the old `data_version`'s key).
+#: Since a new graph object is created by every `rebuild()` (atomic swap,
+#: never in-place mutation -- `backend/graph/cache.py`), its identity alone
+#: already changes exactly when `data_version` does; `data_version` is kept
+#: as an explicit key component anyway to match CLAUDE.md's literal cache
+#: key and for readability. `ship_jump_range_gm`/`ship_cargo_capacity_scu`
+#: are *not* part of the key: they're a deterministic function of
+#: `(ship_id, data_version)` (the same ship's stats can't change without a
+#: refresh, which changes `data_version` too), so including them would add
+#: no new cache-key entropy -- they're only needed inside as plain
+#: computation inputs, exactly like `buy_prices`/`sell_prices`.
+_route_cache_lock = threading.Lock()
+_route_cache: "OrderedDict[tuple, RouteSearchResult]" = OrderedDict()
 
-@functools.lru_cache(maxsize=_ROUTE_CACHE_MAXSIZE)
+
 def _cached_search(
     graph: nx.DiGraph,
+    buy_prices: dict[int, dict[int, float]],
+    sell_prices: dict[int, dict[int, float]],
     start_terminal_id: int,
-    max_distance: float,
-    distance_threshold: float,
+    ship_id: int,
+    num_hops: int,
+    starting_budget: float,
+    ship_jump_range_gm: float,
+    ship_cargo_capacity_scu: float,
     data_version: int | None,
 ) -> RouteSearchResult:
-    """CLAUDE.md's `/route` LRU cache key is `(start_terminal_id,
-    max_distance, distance_threshold, cache_data_version)`; `graph` rides
-    along as an extra key component (hashed/compared by object identity,
-    like any plain Python object -- `networkx.Graph` defines no custom
-    `__eq__`/`__hash__`) purely so this function operates on the *exact*
-    graph object the caller already validated `start_terminal_id` against,
-    rather than re-fetching `get_graph_cache().get_graph()` in here and
-    risking it having raced ahead to a newer `rebuild()` in between --
-    which would compute against the new graph while getting cached under
-    the old `data_version`'s key. Since a new graph object is created by
-    every `rebuild()` (atomic swap, never in-place mutation --
-    `backend/graph/cache.py`), its identity alone already changes exactly
-    when `data_version` does; `data_version` is kept as an explicit
-    parameter anyway to match CLAUDE.md's literal cache key and for
-    readability.
+    """Cache-or-compute `find_best_route()`. See the module-level comment
+    above `_route_cache` for why this is a hand-rolled LRU rather than
+    `functools.lru_cache`.
     """
-    return find_best_route(
+    key = (id(graph), start_terminal_id, ship_id, num_hops, starting_budget, data_version)
+
+    with _route_cache_lock:
+        cached = _route_cache.get(key)
+        if cached is not None:
+            _route_cache.move_to_end(key)
+            return cached
+
+    result = find_best_route(
         graph,
         start_terminal_id=start_terminal_id,
-        max_distance=max_distance,
-        distance_threshold=distance_threshold,
+        num_hops=num_hops,
+        starting_budget=starting_budget,
+        ship_jump_range_gm=ship_jump_range_gm,
+        ship_cargo_capacity_scu=ship_cargo_capacity_scu,
+        buy_prices=buy_prices,
+        sell_prices=sell_prices,
         settings=get_settings(),
     )
+
+    with _route_cache_lock:
+        _route_cache[key] = result
+        _route_cache.move_to_end(key)
+        while len(_route_cache) > _ROUTE_CACHE_MAXSIZE:
+            _route_cache.popitem(last=False)
+
+    return result
+
+
+def _cached_search_cache_clear() -> None:
+    """Test-only reset hook, mirroring `functools.lru_cache`'s
+    `.cache_clear()` API so existing test isolation fixtures keep working
+    unchanged against this hand-rolled cache.
+    """
+    with _route_cache_lock:
+        _route_cache.clear()
+
+
+_cached_search.cache_clear = _cached_search_cache_clear  # type: ignore[attr-defined]
 
 
 def _to_route_response(
@@ -68,7 +127,13 @@ def _to_route_response(
 ) -> RouteResponse:
     if not result.found:
         return RouteResponse(
-            found=False, start_terminal_id=result.start_terminal_id, message=result.message
+            found=False,
+            start_terminal_id=result.start_terminal_id,
+            starting_budget=result.starting_budget,
+            final_cash=result.final_cash,
+            total_distance=0.0,
+            total_profit=0.0,
+            message=result.message,
         )
 
     hops = [
@@ -80,6 +145,9 @@ def _to_route_response(
                 commodity_names.get(hop.commodity_id) if hop.commodity_id is not None else None
             ),
             distance_from_previous=hop.distance_from_previous,
+            quantity_traded=hop.quantity_traded,
+            unit_buy_price=hop.unit_buy_price,
+            unit_sell_price=hop.unit_sell_price,
             profit_this_hop=hop.profit_this_hop,
         )
         for hop in result.hops
@@ -90,6 +158,8 @@ def _to_route_response(
         hops=hops,
         total_distance=result.total_distance,
         total_profit=result.total_profit,
+        starting_budget=result.starting_budget,
+        final_cash=result.final_cash,
     )
 
 
@@ -100,35 +170,45 @@ def search_route(payload: RouteRequest, request: Request) -> RouteResponse:
     snapshot = get_graph_cache().get_snapshot()
     graph = snapshot.graph
 
-    # CLAUDE.md security ground rules: start_terminal_id must be checked
-    # against real known terminals (404, not a raw lookup failure); Pydantic
-    # (`RouteRequest`) already enforces `max_distance`/`distance_threshold`
-    # positivity -- the server-side *maximum* caps below are runtime config,
-    # so they're enforced here rather than as static schema constraints.
+    # CLAUDE.md security ground rules: start_terminal_id and ship_id must be
+    # checked against real known terminals/ships (404, not a raw lookup
+    # failure); Pydantic (`RouteRequest`) already enforces `num_hops > 0` /
+    # `starting_budget >= 0` -- the server-side *maximum* caps below are
+    # runtime config, so they're enforced here rather than as static schema
+    # constraints.
     if payload.start_terminal_id not in graph:
         raise HTTPException(status_code=404, detail="Unknown start_terminal_id.")
 
-    if payload.max_distance > settings.max_distance_cap:
+    with session_scope() as session:
+        ship = session.get(Ship, payload.ship_id)
+    if ship is None:
+        raise HTTPException(status_code=404, detail="Unknown ship_id.")
+
+    if payload.num_hops > settings.max_hops_cap:
         raise HTTPException(
             status_code=422,
-            detail=f"max_distance exceeds the server-enforced maximum of {settings.max_distance_cap}.",
+            detail=f"num_hops exceeds the server-enforced maximum of {settings.max_hops_cap}.",
         )
 
-    distance_threshold = (
-        payload.distance_threshold
-        if payload.distance_threshold is not None
-        else settings.distance_threshold_default
-    )
-    if distance_threshold > settings.distance_threshold_max:
+    if payload.starting_budget > settings.max_starting_budget_cap:
         raise HTTPException(
             status_code=422,
             detail=(
-                f"distance_threshold exceeds the server-enforced maximum of "
-                f"{settings.distance_threshold_max}."
+                f"starting_budget exceeds the server-enforced maximum of "
+                f"{settings.max_starting_budget_cap}."
             ),
         )
 
     result = _cached_search(
-        graph, payload.start_terminal_id, payload.max_distance, distance_threshold, snapshot.data_version
+        graph,
+        snapshot.buy_prices,
+        snapshot.sell_prices,
+        payload.start_terminal_id,
+        payload.ship_id,
+        payload.num_hops,
+        payload.starting_budget,
+        ship.quantum_range_gm,
+        ship.cargo_capacity_scu,
+        snapshot.data_version,
     )
     return _to_route_response(graph, snapshot.commodity_names, result)
