@@ -65,11 +65,23 @@ class GraphCacheSnapshot:
     Returned by `rebuild()` itself (for a caller like the `/refresh` router
     that wants the fresh counts/warnings immediately) and readable
     piecemeal afterwards via `GraphCache`'s individual getters.
+
+    `buy_prices`/`sell_prices` (Phase 2) are the same bulk-loaded
+    `terminal_id -> {commodity_id: price}` indices
+    `backend/graph/builder.py`'s `build_graph()` already builds -- carried
+    here as first-class snapshot fields, built once per `rebuild()` and
+    atomically swapped in exactly like `graph` itself, so
+    `backend/graph/search.py`'s cash-aware, per-hop commodity selection
+    never needs its own DB round trip on the `/route` hot path. Same
+    "build once per refresh, not once per request" performance property as
+    the graph.
     """
 
     graph: nx.DiGraph
     data_version: Optional[int]
     commodity_names: dict[int, str] = field(default_factory=dict)
+    buy_prices: dict[int, dict[int, float]] = field(default_factory=dict)
+    sell_prices: dict[int, dict[int, float]] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
 
 
@@ -106,6 +118,18 @@ class GraphCache:
     def get_commodity_names(self) -> dict[int, str]:
         return dict(self._snapshot.commodity_names)
 
+    def get_buy_prices(self) -> dict[int, dict[int, float]]:
+        """Shallow copy of `terminal_id -> {commodity_id: buy_price}` --
+        same shallow-copy convention as `get_commodity_names()`: the outer
+        dict is a fresh copy (safe to mutate), the per-terminal inner dicts
+        are shared with the live snapshot (not mutated by any caller in
+        this codebase)."""
+        return dict(self._snapshot.buy_prices)
+
+    def get_sell_prices(self) -> dict[int, dict[int, float]]:
+        """Shallow copy of `terminal_id -> {commodity_id: sell_price}` -- see `get_buy_prices()`."""
+        return dict(self._snapshot.sell_prices)
+
     def get_warnings(self) -> list[str]:
         return list(self._snapshot.warnings)
 
@@ -128,6 +152,8 @@ class GraphCache:
                 graph=build_result.graph,
                 data_version=data_version,
                 commodity_names=build_result.commodity_names,
+                buy_prices=build_result.buy_prices,
+                sell_prices=build_result.sell_prices,
                 warnings=build_result.warnings,
             )
             self._snapshot = snapshot  # atomic swap -- see module docstring

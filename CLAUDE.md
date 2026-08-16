@@ -9,10 +9,11 @@ not a reason to guess.
 ## Project summary
 
 A local, all-Python full-stack web app that computes efficient Star Citizen
-commodity trading routes: given a starting station/terminal and a max travel
-distance budget, it finds the walk through the in-game trade network that
-maximizes accumulated profit, using live commodity price data pulled from
-public APIs. Backend is **FastAPI** (Python 3.11+) with **SQLite** (via
+commodity trading routes: given a starting station/terminal, a selected
+ship (its quantum drive range and cargo capacity), a hop-count budget, and
+a starting cash balance, it finds the walk through the in-game trade
+network that maximizes final cash on hand, using live commodity price data
+pulled from public APIs. Backend is **FastAPI** (Python 3.11+) with **SQLite** (via
 SQLAlchemy) as a local on-disk cache of API data, and an in-memory
 **networkx `DiGraph`** built from that cache. Frontend is **Streamlit**,
 talking to the backend over local HTTP only. No auth, no deployment concerns
@@ -23,71 +24,159 @@ rules" below), but infrastructure-level protections (WAF, ALB, Shield, TLS,
 Secrets Manager, CloudWatch) are explicitly out of scope until that move
 actually happens.
 
-## Data model & edge weight formula
+## Data model & search resources (Phase 2: hop count, cash, cargo)
+
+**Phase 1 note:** this section originally described a continuous
+distance-budget/edge-weight-formula model with Pareto-frontier dominance
+pruning. Phase 2 (Task 14) replaced that model outright — a ship's quantum
+range now gates which edges are even traversable (a hard per-hop filter,
+not a weight denominator), the search is bounded by an integer hop count
+instead of a distance budget, and the traveler's real cash/cargo are
+tracked so profit is an absolute, quantity-scaled aUEC amount, not a
+per-unit rate. This rewrite describes the current model precisely; nothing
+below should be read as "the same as before, just reworded."
 
 - **Node** = a single trade-capable terminal (not a whole station — a
   station can host multiple terminals with different prices). Non-commodity
   terminals (ship dealers, refuel-only, etc.) are filtered out during
-  ingestion.
-- **Edge a→b** exists only if `distance(a, b) <= DISTANCE_THRESHOLD`
-  (configurable; edges above the threshold are simply not created).
-- **Edge weight — the blended model (confirmed, do not change):**
-
-  ```
-  weight(a→b) = max over all commodities c of:
-      max(0, sell_price(c, b) - buy_price(c, a)) / distance(a, b)
-  ```
-
-  The single blended graph picks the best commodity independently per edge
-  (not one graph per commodity). Store which commodity achieved the max as
-  edge metadata (`best_commodity`) so a result route can say "buy Laranite
-  here, sell it there."
-  - A commodity only participates in that `max` if it has **both** a valid
-    buy price at `a` **and** a valid sell price at `b`. A **missing** price
-    is *excluded* from consideration, never treated as `0` — `0` means
-    "known and unprofitable," missing means "not traded there at all."
-  - If no commodity is profitable on an edge, `weight = 0` (the edge still
-    exists and still costs distance budget — occasionally useful as a
-    bridge hop).
-  - **`MIN_DISTANCE` floor:** two terminals at the same physical station can
-    be ~0 in-game distance apart. Divide-by-zero is prevented by flooring
-    the denominator at `min_distance_floor` (from config), never dividing by
-    a raw distance that could be zero.
+  ingestion. Unchanged from Phase 1.
+- **Edge a→b** exists for every known directed distance between two
+  commodity-trading terminals (from the `Distance` table) — the graph
+  itself is **not** pre-filtered by any distance threshold at build time.
+  Each edge carries exactly one attribute: `distance` (the raw, unfloored
+  gigameters value from the `Distance` row). Per-hop traversal is filtered
+  at *search* time by the **selected ship's quantum range**
+  (`ship_jump_range_gm`, sourced from the `Ship` the user picked) — an edge
+  is only traversable if `edge.distance <= ship_jump_range_gm`. This fully
+  replaces Phase 1's `distance_threshold` request parameter; there is no
+  standalone `DISTANCE_THRESHOLD`/`distance_threshold` concept anymore.
+- **No precomputed edge weight/profit/best_commodity.** Which commodity is
+  profit-maximizing on an edge now depends on how much cash the traveler
+  has *when they arrive* at the edge's origin — a search-time fact, not a
+  graph-build-time one — so `backend/graph/builder.py` no longer computes
+  any of that. It still bulk-loads `buy_prices`/`sell_prices`
+  (`terminal_id -> {commodity_id: price}`, one query each, same
+  missing-vs-zero discipline as always — a `None`/absent price is *never*
+  inserted, so "missing" and "known to be zero" stay distinguishable) and
+  returns them via `GraphBuildResult`; `backend/graph/cache.py`'s
+  `GraphCacheSnapshot` carries `graph`, `buy_prices`, and `sell_prices`
+  together, built once per refresh and atomically swapped in as one unit —
+  same "build once per refresh, not once per request" performance property
+  as the graph itself.
+- **Per-hop commodity/quantity selection (cash- and cargo-aware), done at
+  search time in `backend/graph/search.py`:** for edge `a→b`, given `cash`
+  on hand at `a` and the selected ship's `ship_cargo_capacity_scu`: for
+  each commodity `c` with **both** a valid buy price at `a` **and** a valid
+  sell price at `b` (set-intersection of the two indices — a missing price
+  excludes the commodity from consideration entirely, never treated as
+  `0`, exactly as before):
+  - `quantity_c = min(floor(cash / buy_price(c, a)), ship_cargo_capacity_scu)`
+    when `buy_price(c, a) > 0`; else `quantity_c = ship_cargo_capacity_scu`
+    (a free/non-positive-cost commodity — extremely unlikely given Task
+    13's curated commodity set, but handled correctly rather than dividing
+    by zero).
+  - `profit_c = quantity_c * (sell_price(c, b) - buy_price(c, a))`, only a
+    candidate when `sell_price(c, b) > buy_price(c, a)`.
+  - The commodity maximizing **total** `profit_c` wins — not per-unit
+    margin. This is the whole point of cash-awareness: a cheaper commodity
+    with a more affordable quantity can beat a pricier one with a better
+    per-unit margin once cash is limited.
+  - If no commodity is profitable (or cash is `0` and nothing is free),
+    the hop is a neutral **"bridge" hop**: `quantity = 0`, `profit = 0`,
+    `commodity_id = None`, cash unchanged — same bridge-hop concept as
+    Phase 1, just cash-aware now. The edge still exists and still costs a
+    hop — occasionally useful to reach a profitable edge further along.
+- **Simplifying assumption, stated explicitly rather than silently
+  assumed:** 1 tradeable unit ≈ 1 SCU of cargo space for the cargo-cap
+  calculation above. The real game has per-commodity box sizes; this is
+  fine for realistic routing, not a perfect SCU accounting model. Revisit
+  only if this turns out to matter in practice.
+- **`min_distance_floor`'s role today:** applied **once, at ingestion
+  time** (`backend/ingest/refresh.py`), to give same-orbit terminal pairs a
+  sensible nonzero *stored* `Distance.distance`. It is **not** a
+  divide-by-zero guard in a weight formula anymore — no such formula
+  exists in Phase 2. Neither `backend/graph/builder.py` nor
+  `backend/graph/search.py` reads `min_distance_floor` at all.
 
 ## Route search problem
 
-This is **not** vanilla Dijkstra, and must not be implemented as a
-flipped-comparator Dijkstra (that would loop forever exploiting a
-positive-weight cycle). The actual problem: **starting from a fixed node,
-find the walk (revisits/cycles allowed) that maximizes total accumulated
-edge weight, subject to total distance travelled ≤ a user-chosen budget.**
-This is a resource-constrained longest-path problem, solved with a
-**label-setting search** over states `(node, distance_used)`:
+**The resource being spent is now an integer hop count, not a continuous
+distance budget.** Starting from a fixed node with `starting_budget` cash
+and a ship of `ship_cargo_capacity_scu` cargo capacity, find the walk
+(revisits/cycles allowed) of **at most `num_hops` hops** that ends with the
+most cash on hand. Each hop must cross an edge whose raw
+`distance <= ship_jump_range_gm` (see above). `max_distance` no longer
+exists as a concept anywhere in this app.
 
-- A *label* is `(current_node, distance_used_so_far, cumulative_weight, path)`.
-- Explore with a max-priority queue ordered by `cumulative_weight`
-  (best-first).
-- From a label at `n`, for each outgoing edge `n→m` with
-  `distance_used + d(n,m) <= budget`, push a new label at `m`.
-- **Dominance pruning:** at a given node, label `A` dominates label `B` if
-  `A.distance_used <= B.distance_used` and
-  `A.cumulative_weight >= B.cumulative_weight` — drop dominated labels. This
-  keeps the frontier tractable.
-- Termination is guaranteed because every edge has strictly positive
-  distance, so `distance_used` strictly increases each hop — the budget
-  bounds the number of hops even though the underlying graph has cycles.
-- Best answer = highest-`cumulative_weight` label seen across all nodes when
-  the queue empties.
-- **Anytime behavior / safety valves:** a configurable cap on labels
-  retained per node (`search_label_cap_per_node`, keep top-K by weight) and
-  a wall-clock/iteration budget (`search_time_budget_seconds`) bound
-  worst-case latency on a dense graph. Because the search is best-first, the
-  best label found so far when the cap/timeout hits is always a valid,
-  reasonable answer — return "best found within budget," never fail or hang.
+- **State is `(node, hops_used, cash)`.** Implemented in
+  `backend/graph/search.py` as a **plain bounded dynamic program**, not a
+  priority-queue label-setting search: for `hop` from `1` to `num_hops`,
+  for every node with a label at `hop - 1`, try every valid (jump-range-filtered)
+  outgoing edge, compute the resulting cash via the per-hop commodity/quantity
+  selection above, and keep only the single best (max-cash) label per
+  `(node, hop)` — a `dict`-backed table, overwriting only on strict
+  improvement.
+- **No Pareto-frontier dominance pruning — a proven simplification, not a
+  shortcut.** At a fixed `(node, hops_used)`, more cash always **weakly
+  dominates** less cash: a higher-cash label can always replicate every
+  future buying decision a lower-cash label at the same `(node, hops_used)`
+  would make, because `quantity` is monotonically non-decreasing in `cash`
+  and capped by the *same fixed* `ship_cargo_capacity_scu` regardless of
+  which label is being extended — so the higher-cash label ends up with at
+  least as much cash at every subsequent hop too. There is no second axis
+  to trade off the way `distance_used` traded off against
+  `cumulative_weight` in Phase 1. This is why a single best-cash label per
+  `(node, hop)` is provably sufficient — no label cap, no per-node cap
+  setting, no priority queue needed at all. The entire state space is
+  `O(nodes * num_hops)`, already small and exactly bounded by construction,
+  not something that needs a heuristic top-K safety valve to stay
+  tractable.
+- **Parent-pointer path reconstruction, from the start.** A label is
+  `(node, hops_used, cash, previous: Label | None, ...per-hop trade
+  details)`. `previous` is a parent pointer, never a materialized path —
+  this project already hit and fixed a real O(depth) performance bug from
+  exactly the opposite mistake in the Phase 1 algorithm (`backend/graph/
+  search.py`'s git history: "search.py O(depth) path storage" —
+  concatenating a new tuple onto a path at every hop made label creation
+  itself O(depth) and left many long-lived labels each holding an
+  independent long tuple, dominating wall time in post-search
+  reference-counting teardown). The Phase 2 algorithm is built with that
+  lesson already applied: every label is O(1) to create, and only the
+  single winning label, once, ever pays to walk its `previous` chain back
+  to the start.
+- **Termination is now structural, not merely resource-bounded.** The DP is
+  a fixed loop over `hop in 1..num_hops`; it is never a frontier that could
+  keep re-queuing a profitable cycle. Unlike Phase 1 (where a naive
+  flipped-comparator Dijkstra would have looped forever exploiting a
+  positive-weight cycle, which is exactly why Phase 1 needed budget +
+  dominance pruning to terminate), Phase 2's algorithm structurally cannot
+  hang regardless of how many profitable cycles the graph contains — it
+  simply revisits the same node at a later `hop` with a higher `cash`.
+- **Best answer = highest-cash label across every `(node, hop)` with `hop`
+  from `0` to `num_hops` inclusive** — not only `hop == num_hops`. A
+  dead-end node has no way to "pad" a great short route out to the full hop
+  count with neutral bridge hops, so requiring the exact count would
+  wrongly disqualify it.
+- **Anytime behavior / safety valve:** `settings.search_time_budget_seconds`
+  bounds total wall-clock time, checked once between fully-computed hop
+  levels (never mid-level, so a firing deadline always leaves the DP table
+  in a complete, consistent state to compute the best answer from) — cheap
+  defense in depth, not expected to realistically fire given the tightly
+  bounded state space this algorithm actually explores. There is no
+  per-node label cap setting in Phase 2 (Phase 1's
+  `search_label_cap_per_node` no longer applies to anything).
+- **"Found" vs. "no profitable route":** `found=True` iff the best cash
+  found is **strictly greater** than `starting_budget` — real, positive
+  realized profit, not merely "didn't lose money." This differs from
+  Phase 1's `cumulative_weight > 0` check (weight could never go negative
+  there; cash very much can stay exactly flat across a walk made entirely
+  of bridge hops, and that must not be reported as "found").
 - **Isolated start node:** if the chosen start terminal has zero viable
-  outgoing edges under the current distance threshold, return a clean "no
-  profitable route found from here" result — not an exception, not an empty
-  crash.
+  outgoing edges under the selected ship's quantum range, this falls out
+  naturally with no special-casing needed — no hop-1 labels get created at
+  all, the only candidate is the `hop=0` starting label itself
+  (`cash == starting_budget`), which is not strictly greater than
+  `starting_budget`, so `found=False`.
 
 ## Two-tier caching architecture
 
@@ -109,11 +198,15 @@ This is a resource-constrained longest-path problem, solved with a
      request while one is in flight gets `409`, never runs concurrently
      with the first (protects against double-hitting external APIs and
      racing cache writes).
-   - A small **LRU cache on `/route` results**, keyed on
+   - A small **LRU cache on `/route` results**, keyed on the request's
+     search parameters plus `cache_data_version` (Phase 1:
      `(start_terminal_id, max_distance, distance_threshold,
-     cache_data_version)`, so repeated/lightly-tweaked queries against the
-     same refreshed dataset return instantly. The data-version component
-     makes it self-invalidating on every refresh.
+     cache_data_version)`; Phase 2 replaces the middle two with the new
+     request shape — `(start_terminal_id, ship_id, num_hops,
+     starting_budget, cache_data_version)`, per Task 15's schema/router
+     rework), so repeated/lightly-tweaked queries against the same
+     refreshed dataset return instantly. The data-version component makes
+     it self-invalidating on every refresh.
 
 ## Project structure
 
@@ -133,8 +226,8 @@ StarCitizen Trader/
     ingest/
       refresh.py               # orchestrates clients -> cache DB, ID joining, filtering
     graph/
-      builder.py                # cache DB -> networkx DiGraph with weights (pure, bulk-loaded)
-      search.py                  # label-setting constrained max-weight search
+      builder.py                # cache DB -> networkx DiGraph + bulk buy/sell price indices (pure)
+      search.py                  # bounded hop-count/cash/cargo DP search (Phase 2)
       cache.py                    # GraphCache singleton: build-once-per-refresh, atomic swap
     routers/
       terminals.py                # GET /terminals
@@ -144,7 +237,7 @@ StarCitizen Trader/
     app.py                    # Streamlit UI, calls backend over localhost
   tests/
     fixtures/                 # recorded JSON responses from both APIs
-    unit/                     # weight formula, graph builder, search algorithm
+    unit/                     # price indices, graph builder, search algorithm
     integration/               # refresh pipeline + FastAPI TestClient
     perf/                      # synthetic large-graph benchmark (wall-clock budget)
   scripts/
@@ -397,10 +490,12 @@ blocking finding:
 - **All user-facing input (query params, request bodies) must be validated
   server-side with explicit bounds**, regardless of what the frontend UI
   enforces. Pydantic models rejecting malformed types by construction is
-  not enough on its own — e.g. `start_terminal_id` must be checked against
-  real known terminals (404, not a raw lookup failure, if it doesn't
-  exist); `max_distance` and `distance_threshold` must be positive and
-  capped at a configured sane maximum enforced server-side. A raw API
+  not enough on its own — e.g. `start_terminal_id` and (Phase 2) `ship_id`
+  must be checked against real known terminals/ships (404, not a raw lookup
+  failure, if either doesn't exist); (Phase 2) `num_hops` and
+  `starting_budget` must be positive/non-negative and capped at a
+  configured sane maximum (`settings.max_hops_cap`,
+  `settings.max_starting_budget_cap`) enforced server-side. A raw API
   request can always skip the UI entirely.
 - **Never use `unsafe_allow_html=True` in Streamlit** on any data sourced
   from the external APIs — terminal/commodity names come from external,

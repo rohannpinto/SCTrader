@@ -10,6 +10,13 @@ committed in their own `session_scope` block *before* child rows
 FK columns with no `relationship()` mapping, so SQLAlchemy's unit-of-work
 has no cross-class dependency info to auto-order a single mixed flush by --
 mirrors the same convention already used in `test_db_models.py`.
+
+Phase 2: `build_graph()` no longer computes a per-edge `weight`/`profit`/
+`best_commodity_id` (that decision moved to `backend/graph/search.py`,
+which is cash-aware at query time) -- edges carry only `distance`, and the
+bulk `buy_prices`/`sell_prices` indices ride on `GraphBuildResult` instead
+of being consumed internally. See `backend/graph/builder.py`'s module
+docstring for the full rationale.
 """
 
 from __future__ import annotations
@@ -45,7 +52,7 @@ def _now() -> datetime:
 
 
 def _settings(**overrides) -> Settings:
-    defaults: dict = dict(min_distance_floor=1.0, graph_edge_count_guardrail=50000)
+    defaults: dict = dict(graph_edge_count_guardrail=50000)
     defaults.update(overrides)
     return Settings(**defaults)
 
@@ -97,7 +104,7 @@ def test_node_attributes_carry_display_metadata(engine):
     assert attrs["location_name"] == "Levski"
 
 
-# --- weight formula: best commodity picked per edge -------------------------
+# --- edges carry only `distance` (Phase 2) ------------------------------------
 
 
 def _seed_two_terminals_and_commodities(session):
@@ -108,41 +115,7 @@ def _seed_two_terminals_and_commodities(session):
     session.add(Commodity(id=2, wiki_uuid="u2", slug="agricium", name="Agricium"))
 
 
-def test_weight_picks_max_profit_commodity_across_candidates(engine):
-    with session_scope(engine) as session:
-        _seed_two_terminals_and_commodities(session)
-
-    with session_scope(engine) as session:
-        session.add(Distance(terminal_a_id=1, terminal_b_id=2, distance=10.0, fetched_at=_now()))
-        # Laranite: buy 100 @ A, sell 150 @ B -> profit 50
-        session.add(
-            Price(terminal_id=1, commodity_id=1, price_buy=100.0, price_sell=None, fetched_at=_now())
-        )
-        session.add(
-            Price(terminal_id=2, commodity_id=1, price_buy=None, price_sell=150.0, fetched_at=_now())
-        )
-        # Agricium: buy 100 @ A, sell 300 @ B -> profit 200 (should win)
-        session.add(
-            Price(terminal_id=1, commodity_id=2, price_buy=100.0, price_sell=None, fetched_at=_now())
-        )
-        session.add(
-            Price(terminal_id=2, commodity_id=2, price_buy=None, price_sell=300.0, fetched_at=_now())
-        )
-
-    result = build_graph(engine=engine, settings=_settings())
-
-    edge = result.graph.edges[1, 2]
-    assert edge["best_commodity_id"] == 2
-    assert edge["profit"] == 200.0
-    assert edge["weight"] == pytest.approx(200.0 / 10.0)
-    assert edge["distance"] == 10.0
-
-
-def test_missing_price_excludes_commodity_not_treated_as_zero(engine):
-    # Commodity 1 has a buy price at A but NO sell price row at B at all
-    # (not price_sell=0.0 -- genuinely absent) -- must be excluded from
-    # consideration entirely, not scored as a -100 loss (which would still
-    # correctly lose to weight=0, but must not raise/crash either).
+def test_edge_carries_only_distance_attribute(engine):
     with session_scope(engine) as session:
         _seed_two_terminals_and_commodities(session)
 
@@ -151,104 +124,52 @@ def test_missing_price_excludes_commodity_not_treated_as_zero(engine):
         session.add(
             Price(terminal_id=1, commodity_id=1, price_buy=100.0, price_sell=None, fetched_at=_now())
         )
-        # No Price row at all for terminal 2 / commodity 1.
-
-    result = build_graph(engine=engine, settings=_settings())
-
-    edge = result.graph.edges[1, 2]
-    assert edge["best_commodity_id"] is None
-    assert edge["weight"] == 0.0
-    assert edge["profit"] == 0.0
-
-
-def test_zero_price_is_a_valid_candidate_distinct_from_missing(engine):
-    # price_sell=0.0 at the destination is a real, known price (e.g. a
-    # sell-only terminal has price_buy=0) -- profit here is negative, so
-    # this commodity loses to weight=0, but it must not be confused with
-    # "missing" and must not crash the comparison.
-    with session_scope(engine) as session:
-        _seed_two_terminals_and_commodities(session)
-
-    with session_scope(engine) as session:
-        session.add(Distance(terminal_a_id=1, terminal_b_id=2, distance=10.0, fetched_at=_now()))
         session.add(
-            Price(terminal_id=1, commodity_id=1, price_buy=50.0, price_sell=None, fetched_at=_now())
-        )
-        session.add(
-            Price(terminal_id=2, commodity_id=1, price_buy=None, price_sell=0.0, fetched_at=_now())
+            Price(terminal_id=2, commodity_id=1, price_buy=None, price_sell=300.0, fetched_at=_now())
         )
 
     result = build_graph(engine=engine, settings=_settings())
 
     edge = result.graph.edges[1, 2]
-    assert edge["best_commodity_id"] is None
-    assert edge["weight"] == 0.0
+    assert edge == {"distance": 10.0}
+    assert "weight" not in edge
+    assert "profit" not in edge
+    assert "best_commodity_id" not in edge
 
 
-def test_unprofitable_edge_still_exists_with_zero_weight(engine):
+def test_edge_distance_is_stored_raw_never_floored(engine):
+    # Phase 2: builder.py no longer applies `min_distance_floor` at all --
+    # that responsibility moved entirely to ingestion time
+    # (`backend/ingest/refresh.py`, already covered by
+    # `test_refresh.py::test_same_orbit_terminal_pairs_get_min_distance_floor`).
+    # A raw zero distance (however it got into the DB) is stored as-is.
     with session_scope(engine) as session:
-        _seed_two_terminals_and_commodities(session)
+        session.add(Terminal(id=1, name="A", is_commodity_trading=True))
+        session.add(Terminal(id=2, name="B", is_commodity_trading=True))
+
+    with session_scope(engine) as session:
+        session.add(Distance(terminal_a_id=1, terminal_b_id=2, distance=0.0, fetched_at=_now()))
+
+    result = build_graph(engine=engine, settings=Settings(min_distance_floor=2.5))
+
+    assert result.graph.edges[1, 2]["distance"] == 0.0
+
+
+def test_edge_exists_regardless_of_whether_any_commodity_is_profitable(engine):
+    # No Price rows at all between 1 and 2 -- the edge still exists (a
+    # potential "bridge hop" -- profitability is entirely `search.py`'s
+    # concern now, at query time).
+    with session_scope(engine) as session:
+        session.add(Terminal(id=1, name="A", is_commodity_trading=True))
+        session.add(Terminal(id=2, name="B", is_commodity_trading=True))
 
     with session_scope(engine) as session:
         session.add(Distance(terminal_a_id=1, terminal_b_id=2, distance=10.0, fetched_at=_now()))
-        # Loss on the only candidate commodity: buy 200 @ A, sell 100 @ B.
-        session.add(
-            Price(terminal_id=1, commodity_id=1, price_buy=200.0, price_sell=None, fetched_at=_now())
-        )
-        session.add(
-            Price(terminal_id=2, commodity_id=1, price_buy=None, price_sell=100.0, fetched_at=_now())
-        )
 
     result = build_graph(engine=engine, settings=_settings())
 
     assert result.graph.has_edge(1, 2)
-    edge = result.graph.edges[1, 2]
-    assert edge["weight"] == 0.0
-    assert edge["best_commodity_id"] is None
-
-
-# --- min_distance_floor ------------------------------------------------------
-
-
-def test_zero_distance_uses_min_distance_floor_as_denominator(engine):
-    with session_scope(engine) as session:
-        _seed_two_terminals_and_commodities(session)
-
-    with session_scope(engine) as session:
-        session.add(Distance(terminal_a_id=1, terminal_b_id=2, distance=0.0, fetched_at=_now()))
-        session.add(
-            Price(terminal_id=1, commodity_id=1, price_buy=100.0, price_sell=None, fetched_at=_now())
-        )
-        session.add(
-            Price(terminal_id=2, commodity_id=1, price_buy=None, price_sell=150.0, fetched_at=_now())
-        )
-
-    result = build_graph(engine=engine, settings=_settings(min_distance_floor=2.5))
-
-    edge = result.graph.edges[1, 2]
-    # distance attribute stays the raw, un-floored value (real in-game
-    # distance for reporting) -- only the weight denominator is floored.
-    assert edge["distance"] == 0.0
-    assert edge["weight"] == pytest.approx(50.0 / 2.5)
-
-
-def test_distance_below_floor_still_uses_floor(engine):
-    with session_scope(engine) as session:
-        _seed_two_terminals_and_commodities(session)
-
-    with session_scope(engine) as session:
-        session.add(Distance(terminal_a_id=1, terminal_b_id=2, distance=0.4, fetched_at=_now()))
-        session.add(
-            Price(terminal_id=1, commodity_id=1, price_buy=0.0, price_sell=None, fetched_at=_now())
-        )
-        session.add(
-            Price(terminal_id=2, commodity_id=1, price_buy=None, price_sell=10.0, fetched_at=_now())
-        )
-
-    result = build_graph(engine=engine, settings=_settings(min_distance_floor=1.0))
-
-    edge = result.graph.edges[1, 2]
-    assert edge["weight"] == pytest.approx(10.0 / 1.0)  # floored to 1.0, not 0.4
+    assert result.graph.edges[1, 2] == {"distance": 10.0}
 
 
 # --- directionality -----------------------------------------------------------
@@ -335,6 +256,81 @@ def test_commodity_names_are_bulk_loaded_for_display(engine):
     assert result.commodity_names == {1: "Laranite", 2: "Agricium"}
 
 
+# --- buy_prices / sell_prices bulk indices (Phase 2) --------------------------
+
+
+def test_buy_and_sell_price_indices_are_bulk_loaded(engine):
+    with session_scope(engine) as session:
+        _seed_two_terminals_and_commodities(session)
+
+    with session_scope(engine) as session:
+        session.add(
+            Price(terminal_id=1, commodity_id=1, price_buy=100.0, price_sell=None, fetched_at=_now())
+        )
+        session.add(
+            Price(terminal_id=2, commodity_id=1, price_buy=None, price_sell=200.0, fetched_at=_now())
+        )
+        session.add(
+            Price(terminal_id=1, commodity_id=2, price_buy=50.0, price_sell=75.0, fetched_at=_now())
+        )
+
+    result = build_graph(engine=engine, settings=_settings())
+
+    assert result.buy_prices == {1: {1: 100.0, 2: 50.0}}
+    assert result.sell_prices == {2: {1: 200.0}, 1: {2: 75.0}}
+
+
+def test_missing_price_is_absent_from_index_not_stored_as_zero(engine):
+    with session_scope(engine) as session:
+        _seed_two_terminals_and_commodities(session)
+
+    with session_scope(engine) as session:
+        # Only a buy price at terminal 1 -- no Price row at all for
+        # terminal 2 / commodity 1.
+        session.add(
+            Price(terminal_id=1, commodity_id=1, price_buy=100.0, price_sell=None, fetched_at=_now())
+        )
+
+    result = build_graph(engine=engine, settings=_settings())
+
+    assert result.buy_prices == {1: {1: 100.0}}
+    assert result.sell_prices == {}
+    assert 2 not in result.sell_prices
+
+
+def test_zero_price_is_present_in_index_distinct_from_missing(engine):
+    with session_scope(engine) as session:
+        _seed_two_terminals_and_commodities(session)
+
+    with session_scope(engine) as session:
+        session.add(
+            Price(terminal_id=2, commodity_id=1, price_buy=0.0, price_sell=None, fetched_at=_now())
+        )
+
+    result = build_graph(engine=engine, settings=_settings())
+
+    # A real, known price of 0.0 is present in the index (a valid dict
+    # entry), distinct from "no entry at all" for a different terminal.
+    assert result.buy_prices == {2: {1: 0.0}}
+    assert 1 not in result.buy_prices
+
+
+def test_price_row_touching_non_commodity_terminal_is_skipped(engine):
+    with session_scope(engine) as session:
+        session.add(Terminal(id=1, name="A", is_commodity_trading=True))
+        session.add(Terminal(id=2, name="Ship Dealer", is_commodity_trading=False))
+        session.add(Commodity(id=1, wiki_uuid="u1", slug="laranite", name="Laranite"))
+
+    with session_scope(engine) as session:
+        session.add(
+            Price(terminal_id=2, commodity_id=1, price_buy=100.0, price_sell=None, fetched_at=_now())
+        )
+
+    result = build_graph(engine=engine, settings=_settings())
+
+    assert result.buy_prices == {}
+
+
 # --- empty DB -----------------------------------------------------------------
 
 
@@ -344,4 +340,6 @@ def test_empty_database_yields_empty_graph(engine):
     assert result.graph.number_of_nodes() == 0
     assert result.graph.number_of_edges() == 0
     assert result.commodity_names == {}
+    assert result.buy_prices == {}
+    assert result.sell_prices == {}
     assert result.warnings == []

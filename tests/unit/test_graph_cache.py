@@ -4,6 +4,10 @@ Uses a temp-file SQLite DB seeded directly via the ORM (same convention as
 `test_graph_builder.py`) plus `GraphCache` instantiated directly -- not the
 process-wide `get_graph_cache()` singleton, so tests never leak state into
 each other.
+
+Phase 2: `GraphCacheSnapshot` gains `buy_prices`/`sell_prices` (the bulk
+price indices `backend/graph/builder.py` now returns instead of consuming
+internally) -- covered below alongside the existing atomic-swap guarantees.
 """
 
 from __future__ import annotations
@@ -16,6 +20,7 @@ from backend.config import Settings
 from backend.graph.cache import GraphCache, get_graph_cache
 from backend.models.db import (
     Commodity,
+    Price,
     RefreshRun,
     Terminal,
     create_db_engine,
@@ -52,6 +57,8 @@ def test_initial_state_is_empty_graph_no_version_no_warnings():
     assert graph.number_of_edges() == 0
     assert cache.get_data_version() is None
     assert cache.get_warnings() == []
+    assert cache.get_buy_prices() == {}
+    assert cache.get_sell_prices() == {}
 
 
 # --- rebuild builds from whatever is on disk ----------------------------------
@@ -175,6 +182,69 @@ def test_commodity_names_available_via_snapshot_and_getter(engine):
     # get_commodity_names() returns a copy, not the live dict.
     cache.get_commodity_names()[1] = "mutated externally"
     assert cache.get_commodity_names() == {1: "Laranite"}
+
+
+# --- buy_prices / sell_prices (Phase 2) ---------------------------------------
+
+
+def test_buy_and_sell_prices_available_via_snapshot_and_getters(engine):
+    with session_scope(engine) as session:
+        session.add(Terminal(id=1, name="A", is_commodity_trading=True))
+        session.add(Terminal(id=2, name="B", is_commodity_trading=True))
+        session.add(Commodity(id=1, wiki_uuid="u1", slug="laranite", name="Laranite"))
+
+    with session_scope(engine) as session:
+        session.add(
+            Price(terminal_id=1, commodity_id=1, price_buy=100.0, price_sell=None, fetched_at=_now())
+        )
+        session.add(
+            Price(terminal_id=2, commodity_id=1, price_buy=None, price_sell=200.0, fetched_at=_now())
+        )
+
+    cache = GraphCache()
+    snapshot = cache.rebuild(engine=engine, settings=_settings())
+
+    assert snapshot.buy_prices == {1: {1: 100.0}}
+    assert snapshot.sell_prices == {2: {1: 200.0}}
+    assert cache.get_buy_prices() == {1: {1: 100.0}}
+    assert cache.get_sell_prices() == {2: {1: 200.0}}
+
+    # get_buy_prices()/get_sell_prices() return a fresh outer dict, not the
+    # live one -- mutating the returned copy never touches the snapshot.
+    cache.get_buy_prices()[999] = {1: 1.0}
+    assert 999 not in cache.get_buy_prices()
+
+
+def test_buy_and_sell_prices_survive_a_later_rebuild_atomic_swap(engine):
+    with session_scope(engine) as session:
+        session.add(Terminal(id=1, name="A", is_commodity_trading=True))
+        session.add(Commodity(id=1, wiki_uuid="u1", slug="laranite", name="Laranite"))
+        session.add(Commodity(id=2, wiki_uuid="u2", slug="agricium", name="Agricium"))
+
+    with session_scope(engine) as session:
+        session.add(
+            Price(terminal_id=1, commodity_id=1, price_buy=100.0, price_sell=None, fetched_at=_now())
+        )
+
+    cache = GraphCache()
+    cache.rebuild(engine=engine, settings=_settings())
+    old_snapshot = cache.get_snapshot()
+    assert old_snapshot.buy_prices == {1: {1: 100.0}}
+
+    with session_scope(engine) as session:
+        # A new price row (distinct commodity, no PK conflict with the one
+        # already committed) -- the point is a *changed* snapshot, not
+        # specifically an updated one; a real refresh's upsert semantics
+        # are `backend/ingest/refresh.py`'s concern, not this cache's.
+        session.add(
+            Price(terminal_id=1, commodity_id=2, price_buy=999.0, price_sell=None, fetched_at=_now())
+        )
+    cache.rebuild(engine=engine, settings=_settings())
+
+    # The previously-held snapshot's price indices are untouched by the
+    # later rebuild -- same atomic-swap guarantee as the graph itself.
+    assert old_snapshot.buy_prices == {1: {1: 100.0}}
+    assert cache.get_snapshot().buy_prices == {1: {1: 100.0, 2: 999.0}}
 
 
 # --- process-wide singleton accessor ------------------------------------------

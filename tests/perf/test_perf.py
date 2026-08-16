@@ -3,11 +3,17 @@
 Excluded from the default suite (`pytest -m perf` to run explicitly, per
 `pyproject.toml`) -- these are regression guards against gross algorithmic
 mistakes (an accidental N+1 query, an accidental O(n^2) Python loop, the
-label-setting search's safety valves silently not firing), not strict
-timing assertions. Bounds are deliberately generous so these stay reliable
-on a slow CI/dev machine while still catching a real regression (e.g. a
-search that completely ignores `search_time_budget_seconds` would blow
-even a generous bound by a wide margin).
+search's time-budget safety valve silently not firing), not strict timing
+assertions. Bounds are deliberately generous so these stay reliable on a
+slow CI/dev machine while still catching a real regression.
+
+Phase 2: `test_search_perf_on_large_dense_graph` replaces Phase 1's
+distance-budget/label-cap benchmark -- the new search has no label cap to
+exercise (the whole point of the Phase 2 redesign is that the state space,
+`O(nodes * num_hops)`, is small and exactly bounded without one -- see
+`backend/graph/search.py`'s module docstring), so this benchmarks the
+bounded DP directly at a size well beyond anything Star Citizen's real
+terminal count would produce.
 """
 
 from __future__ import annotations
@@ -56,7 +62,7 @@ def _seed_large_dataset(
     """Bulk-inserts a large, randomly-connected dataset directly via
     `bulk_insert_mappings` (plain dicts, no per-row ORM object construction
     or Python-level looping in the thing actually being benchmarked) --
-    this is test *setup*, not part of what `test_build_graph_perf` times.
+    this is test *setup*, not part of what `test_build_graph_perf_on_large_dataset` times.
     """
     rng = random.Random(_RNG_SEED)
     session_factory = get_session_factory(engine)
@@ -96,7 +102,7 @@ def _seed_large_dataset(
                     }
                 )
             # A handful of commodities priced at every terminal -- enough to
-            # exercise the per-edge max-profit-commodity scan realistically
+            # exercise the per-edge candidate-commodity scan realistically
             # without needing a full price matrix.
             for commodity_id in range(1, commodity_count + 1):
                 price_rows.append(
@@ -134,27 +140,37 @@ def test_build_graph_perf_on_large_dataset(engine):
     assert result.graph.number_of_nodes() == terminal_count
     assert result.graph.number_of_edges() == terminal_count * out_degree
     assert len(result.warnings) == 1  # edge count exceeds the deliberately-low guardrail
+    # Phase 2: buy_prices/sell_prices are bulk-loaded and returned instead of
+    # being consumed into a per-edge weight -- confirm they're actually
+    # populated at this scale too, not just fast.
+    assert len(result.buy_prices) == terminal_count
+    assert len(result.sell_prices) == terminal_count
 
     # Regression guard against an accidental N+1 query or O(n^2) Python-level
-    # loop, not a strict performance SLA -- still generous, but tightened from
-    # an earlier 15.0s bound. An independent review measured this build at
-    # ~0.25-0.3s on real hardware; a per-terminal N+1 query pattern (300
-    # queries) still only reached ~0.3s (SQLite's per-query overhead is too
-    # low at this scale for a single N+1 pass to trip a loose bound), but a
-    # severe per-edge N+1 pattern (~36,000 extra queries) reached ~10.7s.
-    # 5.0s (~15-20x the measured baseline) catches that class of regression
-    # while staying safely clear of normal variance on a slower machine.
+    # loop, not a strict performance SLA. Freshly measured on this machine
+    # (2026-08-15, Phase 2 Task 14), 3 consecutive runs: 0.125s, 0.156s,
+    # 0.140s -- build_graph() (now doing strictly less per-edge work than
+    # Phase 1's version, since there's no per-edge max-profit-commodity scan
+    # anymore -- just three bulk queries and a `graph.add_edge()` loop).
+    # 5.0s (~30x the measured baseline) catches an N+1/brute-force-style
+    # regression while staying safely clear of normal variance on a slower
+    # machine.
     assert elapsed < 5.0, f"build_graph() took {elapsed:.2f}s on a {terminal_count}-terminal dataset"
 
 
-# --- label-setting search: anytime behavior under load -----------------------
+# --- bounded DP search: performance at a large, dense, cyclic state space ----
 
 
-def _large_synthetic_graph(*, node_count: int, out_degree: int) -> nx.DiGraph:
-    """A dense, cyclic graph with a mix of profitable and zero-weight edges
-    -- deliberately adversarial for the search (profitable cycles are
-    exactly what CLAUDE.md warns a flipped-comparator Dijkstra would loop
-    forever on).
+def _large_synthetic_graph_and_prices(
+    *, node_count: int, out_degree: int
+) -> tuple[nx.DiGraph, dict[int, dict[int, float]], dict[int, dict[int, float]]]:
+    """A dense, cyclic graph (deliberately adversarial for a search that
+    revisits nodes) plus `buy_prices`/`sell_prices` indices built the same
+    "single global commodity, random price level per terminal" way as
+    `tests/unit/test_search.py`'s `test_deep_branching_cyclic_search_
+    stays_fast_and_well_formed` -- profitable whenever a hop's destination
+    has a higher price level than its origin, which happens often enough
+    across many random levels to create plenty of profitable cycles.
     """
     rng = random.Random(_RNG_SEED)
     graph = nx.DiGraph()
@@ -165,43 +181,104 @@ def _large_synthetic_graph(*, node_count: int, out_degree: int) -> nx.DiGraph:
         )
         for successor in successors:
             distance = float(rng.randint(5, 50))
-            # ~30% of edges profitable, to guarantee plenty of
-            # positive-weight cycles for the search to (correctly) not get
-            # stuck exploiting forever.
-            weight = float(rng.randint(1, 20)) if rng.random() < 0.3 else 0.0
-            graph.add_edge(
-                node, successor, distance=distance, weight=weight, profit=weight * distance,
-                best_commodity_id=1 if weight > 0 else None,
-            )
-    return graph
+            graph.add_edge(node, successor, distance=distance)
+
+    price_level = {node: float(rng.randint(1, 100)) for node in range(node_count)}
+    buy_prices = {node: {1: level} for node, level in price_level.items()}
+    sell_prices = {node: {1: level} for node, level in price_level.items()}
+    return graph, buy_prices, sell_prices
 
 
-def test_search_respects_time_budget_on_large_dense_graph():
-    graph = _large_synthetic_graph(node_count=2000, out_degree=25)
-    settings = Settings(search_time_budget_seconds=2.0, search_label_cap_per_node=50)
+def test_search_perf_on_large_dense_graph():
+    # 300 terminals, out-degree 60 (matching `test_build_graph_perf_on_
+    # large_dataset`'s density -- comfortably beyond the real 161-terminal
+    # data volume) for 200 hops: a state space of 300 * 200 = 60,000
+    # (node, hop) pairs, each considering up to 60 outgoing edges -- ~3.6
+    # million edge relaxations total. A generous time budget (well beyond
+    # what this needs) so the search runs to true completion rather than
+    # being cut off by the deadline -- `test_search_respects_time_budget_
+    # on_large_dense_graph` below covers the cut-off-by-deadline case
+    # separately.
+    node_count = 300
+    out_degree = 60
+    num_hops = 200
+    graph, buy_prices, sell_prices = _large_synthetic_graph_and_prices(
+        node_count=node_count, out_degree=out_degree
+    )
+    settings = Settings(search_time_budget_seconds=120.0)
 
     started = time.monotonic()
     result = find_best_route(
         graph,
         start_terminal_id=0,
-        max_distance=1_000_000.0,  # budget alone would allow a huge number of hops
-        distance_threshold=1000.0,
+        num_hops=num_hops,
+        starting_budget=1000.0,
+        ship_jump_range_gm=1000.0,  # generous -- the distance filter is not the thing under test
+        ship_cargo_capacity_scu=1_000_000.0,
+        buy_prices=buy_prices,
+        sell_prices=sell_prices,
+        settings=settings,
+    )
+    elapsed = time.monotonic() - started
+
+    # Freshly measured on this machine (2026-08-15, Phase 2 Task 14),
+    # 4 consecutive runs: 4.20s, 4.20s, 4.22s, 4.23s -- the bounded DP over
+    # a 300-node, out-degree-60 graph for a full 200 hops to completion
+    # (no priority queue, no label cap, no dominance bookkeeping, just a
+    # fixed double loop over hop levels). 20.0s (~5x the measured baseline)
+    # is generous enough to stay reliable on a slower/loaded machine while
+    # still catching a real regression (e.g. an accidental O(depth) path
+    # reconstruction on every candidate instead of only the winner, or an
+    # accidental per-hop DB/graph re-query).
+    assert elapsed < 20.0, (
+        f"find_best_route() took {elapsed:.2f}s on a {node_count}-node, "
+        f"{num_hops}-hop search"
+    )
+    assert result.found is True
+    assert len(result.hops) == num_hops
+    assert result.final_cash > result.starting_budget
+
+
+def test_search_respects_time_budget_on_large_dense_graph():
+    # A tighter time budget than the graph would naturally finish within --
+    # confirms the deadline check actually fires and still returns a
+    # well-formed "best found so far" answer rather than running to
+    # completion regardless or crashing. Freshly measured on this machine
+    # (2026-08-15): a 0.05s budget against this graph completes ~4-5 hop
+    # levels (~0.06s wall clock) before the deadline check stops it, far
+    # short of the 2000 requested.
+    node_count = 300
+    out_degree = 60
+    graph, buy_prices, sell_prices = _large_synthetic_graph_and_prices(
+        node_count=node_count, out_degree=out_degree
+    )
+    settings = Settings(search_time_budget_seconds=0.05)
+
+    started = time.monotonic()
+    result = find_best_route(
+        graph,
+        start_terminal_id=0,
+        num_hops=2000,  # far more hops than a 0.05s budget can fully compute
+        starting_budget=1000.0,
+        ship_jump_range_gm=1000.0,
+        ship_cargo_capacity_scu=1_000_000.0,
+        buy_prices=buy_prices,
+        sell_prices=sell_prices,
         settings=settings,
     )
     elapsed = time.monotonic() - started
 
     # Generous slack above the configured budget: the deadline is only
-    # checked once per label popped off the heap, so a single expansion
-    # phase can run slightly over -- this bound exists to catch the budget
-    # being ignored entirely (e.g. an infinite loop on a positive-weight
-    # cycle), not to enforce the budget to the millisecond.
+    # checked once per fully-completed hop level, so a single hop's worth of
+    # work (up to node_count * out_degree edge relaxations) can run slightly
+    # over -- this bound exists to catch the budget being ignored entirely,
+    # not to enforce it to the millisecond.
     assert elapsed < settings.search_time_budget_seconds + 5.0, (
         f"find_best_route() took {elapsed:.2f}s against a "
         f"{settings.search_time_budget_seconds}s budget"
     )
-    # A well-formed answer regardless of outcome -- the anytime guarantee.
     if result.found:
         assert len(result.hops) >= 1
-        assert result.total_distance <= 1_000_000.0
+        assert len(result.hops) < 2000  # the deadline must have cut this well short
     else:
         assert result.hops == ()
