@@ -230,7 +230,17 @@ class WikiCommodityListItem(BaseModel):
 
 
 class WikiCommodityDetail(BaseModel):
-    """Full `GET /commodities/{slug}` response payload (the fields we use)."""
+    """Full `GET /commodities/{slug}` response payload (the fields we use).
+
+    `commodity_groups` (Phase 2 Task 13) is the API's own tagging of what
+    kind of thing this commodity actually is (e.g. `["Mineral"]`,
+    `["ProcessedGoods"]`) -- ingestion (`backend/ingest/refresh.py`) uses it
+    to exclude non-material/seasonal/placeholder items (see
+    `TRADEABLE_COMMODITY_GROUPS` there) from the trade graph entirely.
+    Defaults to an empty list rather than being required, since a
+    genuinely-untagged commodity should fail the allowlist check (empty
+    intersection), not crash parsing.
+    """
 
     model_config = ConfigDict(extra="ignore")
 
@@ -238,6 +248,7 @@ class WikiCommodityDetail(BaseModel):
     slug: str
     name: str
     key: str | None = None
+    commodity_groups: list[str] = Field(default_factory=list)
     uex_prices: WikiUexPrices = Field(default_factory=WikiUexPrices)
 
     @property

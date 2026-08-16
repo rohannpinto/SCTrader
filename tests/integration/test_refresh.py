@@ -33,8 +33,9 @@ import httpx
 import pytest
 import respx
 
+from backend.clients.wiki_client import WikiClient
 from backend.config import Settings
-from backend.ingest.refresh import run_refresh
+from backend.ingest.refresh import TRADEABLE_COMMODITY_GROUPS, run_refresh
 from backend.models.db import (
     Commodity,
     Distance,
@@ -148,8 +149,27 @@ def _vehicle_list_payload() -> dict:
     }
 
 
+def _commodity_list_payload_with_luminalia_gift() -> dict:
+    """`_commodity_list_payload`'s 3 real items plus a real, unmodified 4th:
+    `luminalia-gift` (Phase 2 Task 13's motivating excluded-commodity case --
+    `commodity_groups == ["ProcessedGoods"]`, not in `TRADEABLE_COMMODITY_
+    GROUPS`). Used only by the allowlist-exclusion test below, so the
+    default `_commodity_list_payload`/`EXPECTED_*` counts used by every
+    other test in this module stay untouched."""
+    payload = _commodity_list_payload()
+    detail = _load_fixture("wiki_commodity_luminalia_gift.json")["data"]
+    payload["data"].append(
+        {"uuid": detail["uuid"], "slug": detail["slug"], "name": detail["name"], "key": None}
+    )
+    return payload
+
+
 def _mock_successful_refresh(
-    *, laranite_payload: dict | None = None, vehicles_payload: dict | None = None
+    *,
+    laranite_payload: dict | None = None,
+    vehicles_payload: dict | None = None,
+    commodity_list_payload: dict | None = None,
+    include_luminalia_gift_detail_route: bool = False,
 ) -> None:
     """Registers respx routes for a fully successful refresh, real fixtures.
 
@@ -159,12 +179,15 @@ def _mock_successful_refresh(
     other route still serves the pristine, real fixture. `vehicles_payload`
     is the analogous override for `/vehicles` (see
     `test_ship_ingestion_is_isolated_from_terminal_reconciliation`).
+    `commodity_list_payload` / `include_luminalia_gift_detail_route` are the
+    analogous overrides for Phase 2 Task 13's allowlist-exclusion test (see
+    `test_commodity_curation_allowlist_excludes_luminalia_gift_end_to_end`).
     """
     respx.get(f"{UEX_BASE}/terminals").mock(
         return_value=httpx.Response(200, json=_load_fixture("uex_terminals_sample.json"))
     )
     respx.get(f"{WIKI_BASE}/commodities").mock(
-        return_value=httpx.Response(200, json=_commodity_list_payload())
+        return_value=httpx.Response(200, json=commodity_list_payload or _commodity_list_payload())
     )
     respx.get(f"{WIKI_BASE}/commodities/laranite").mock(
         return_value=httpx.Response(
@@ -179,6 +202,12 @@ def _mock_successful_refresh(
             200, json=_load_fixture("wiki_commodity_inert_materials_sparse.json")
         )
     )
+    if include_luminalia_gift_detail_route:
+        respx.get(f"{WIKI_BASE}/commodities/luminalia-gift").mock(
+            return_value=httpx.Response(
+                200, json=_load_fixture("wiki_commodity_luminalia_gift.json")
+            )
+        )
     respx.get(f"{UEX_BASE}/star_systems").mock(
         return_value=httpx.Response(200, json=_load_fixture("uex_star_systems_sample.json"))
     )
@@ -342,6 +371,58 @@ def test_same_orbit_terminal_pairs_get_min_distance_floor(engine):
                     .one()
                 )
                 assert row.distance == floor_value
+
+
+# --- commodity curation allowlist (Phase 2 Task 13) ---------------------------
+
+# All 8 of these terminal ids appear ONLY in luminalia-gift's real purchase
+# entries -- not in laranite/agricium/inert-materials' -- so if the allowlist
+# filter failed to exclude luminalia-gift before stub-terminal creation, each
+# of these would newly appear as a stub `Terminal` row (and inflate
+# `terminals_count`/`prices_count`). Derived once directly from the real
+# fixtures (same method as this module's other `EXPECTED_*` constants).
+LUMINALIA_ONLY_TERMINAL_IDS = [13, 25, 66, 251, 252, 253, 259, 520]
+
+
+@respx.mock
+def test_commodity_curation_allowlist_excludes_luminalia_gift_end_to_end(engine, caplog):
+    """A real, unmodified 4th commodity (`luminalia-gift`, `commodity_groups
+    == ["ProcessedGoods"]`) is added to the fetched catalog alongside the
+    other 3 (all `Mineral`/`Metal`, which pass). It must never reach the
+    `Commodity`/`Price` tables, and -- because `_reconcile` skips it before
+    ever walking its `purchase_entries` -- must not create any stub
+    `Terminal` rows or `Price` rows for it either. Every count therefore
+    comes out identical to the baseline `EXPECTED_*` run that never saw
+    luminalia-gift at all, proving the exclusion happens at the source, not
+    via some later filter.
+    """
+    with caplog.at_level(logging.INFO, logger="backend.ingest.refresh"):
+        _mock_successful_refresh(
+            commodity_list_payload=_commodity_list_payload_with_luminalia_gift(),
+            include_luminalia_gift_detail_route=True,
+        )
+        result = run_refresh(engine=engine, settings=_settings())
+
+    assert result.status == "success"
+    # Still exactly the 3 allowlisted commodities -- luminalia-gift did not
+    # sneak in as a 4th, despite being present in the fetched catalog.
+    assert result.commodities_count == EXPECTED_COMMODITIES
+    assert result.terminals_count == EXPECTED_TERMINALS
+    assert result.prices_count == EXPECTED_PRICES
+    assert result.distances_count == EXPECTED_DISTANCES
+    assert any(
+        "skipped_by_allowlist=1" in message for message in caplog.messages
+    )
+
+    with session_scope(engine) as session:
+        assert session.query(Commodity).filter_by(slug="luminalia-gift").one_or_none() is None
+        assert session.query(Commodity).count() == EXPECTED_COMMODITIES
+        assert session.query(Terminal).count() == EXPECTED_TERMINALS
+        assert session.query(Price).count() == EXPECTED_PRICES
+
+        # None of luminalia-gift's exclusive terminal ids were created.
+        for ext_id in LUMINALIA_ONLY_TERMINAL_IDS:
+            assert session.query(Terminal).filter_by(uex_terminal_id=ext_id).one_or_none() is None
 
 
 # --- missing vs. zero price ---------------------------------------------------
@@ -603,3 +684,46 @@ def test_failed_refresh_leaves_prior_data_untouched(engine):
         assert {s.wiki_uuid: s.id for s in session.query(Ship).all()} == ship_ids_before
         assert session.query(Price).count() == prices_before
         assert session.query(Distance).count() == distances_before
+
+
+# --- live catalog allowlist verification (Phase 2 Task 13) --------------------
+
+
+@pytest.mark.live
+def test_live_commodity_catalog_allowlist_pass_exclude_counts_in_ballpark():
+    """Pulls the full, real live commodity catalog (list + every detail) and
+    checks `TRADEABLE_COMMODITY_GROUPS` behaves sanely against current data.
+
+    Not a correctness test on exact numbers -- the live catalog can drift
+    (seasonal items rotate, new commodities get added) -- so this checks
+    order-of-magnitude bounds and specific known items rather than exact
+    counts. Still catches a gross regression (e.g. the allowlist excluding
+    everything, or `commodity_groups` silently going missing/empty across
+    the board from a schema change). See CLAUDE.md's Task 13 addendum for
+    the exact counts observed when this was written (206 total commodities:
+    157 passed, 49 excluded).
+    """
+    client = WikiClient()
+    try:
+        items = client.list_all_commodities()
+        details = [client.get_commodity_detail(item.slug) for item in items]
+    finally:
+        client.close()
+
+    def _passes(detail):
+        return not TRADEABLE_COMMODITY_GROUPS.isdisjoint(detail.commodity_groups)
+
+    passed = [d for d in details if _passes(d)]
+    excluded = [d for d in details if not _passes(d)]
+
+    assert len(details) > 100  # sanity: a real catalog, not an empty/broken response
+    assert len(passed) > 100  # the large majority are real, tradeable materials
+    assert len(excluded) > 10  # non-material/placeholder/seasonal items genuinely exist
+
+    passed_slugs = {d.slug for d in passed}
+    excluded_slugs = {d.slug for d in excluded}
+    # The specific motivating case (a "profitable" seasonal-collectible
+    # route) must stay excluded against live data, not just a frozen fixture.
+    assert "luminalia-gift" in excluded_slugs
+    # A known real material stays included.
+    assert "laranite" in passed_slugs

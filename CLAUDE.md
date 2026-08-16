@@ -322,6 +322,66 @@ shared-context summary.
     test_live_orbital_station_planet_association_smoke` (checks Everus
     Harbor, Baijini Point, and Terra Gateway by name against live data,
     plus the "moon_name set implies planet_name set" invariant).
+- **Task 13 — commodity curation allowlist, verified against the live
+  catalog (2026-08-15):** `backend/ingest/refresh.py`'s
+  `TRADEABLE_COMMODITY_GROUPS` allowlist (`Metal, Mineral, Nonmetal,
+  Halogen, Alloy, Gas, UnrefinedOres, Raw_Minerals, SyntheticMaterials,
+  Waste, Food, Organic, Vice`, OR semantics against a commodity's
+  `commodity_groups`) was checked against every commodity the live wiki API
+  actually returns, not just the fixtures. Pulled the full `GET
+  /commodities` catalog (206 commodities) plus every commodity's detail
+  response (for `commodity_groups`):
+  - **157 pass, 49 excluded.** Group-by-group breakdown of the 49 excluded:
+    43 `ProcessedGoods`-only, 11 `Bulk_Supplies` (all also tagged
+    `ProcessedGoods` — ship ammunition sizes 1–9 plus decoy/noise
+    countermeasures), 2 `HeatPlaceholder` ("Heat", "Cooler"), 2 `CleanAir`
+    ("Molina Mold" and one item with an empty `name` field, slug
+    `vipcryopod` — see the "surprising" note below), 1 `PowerPlaceholder`
+    ("Power:"), 1 `LifeSupportPlaceholder` ("Life Support"). (Some
+    commodities carry more than one group, so per-group pass/fail counts
+    don't sum to 206/157/49 — e.g. every `Bulk_Supplies` item is also
+    `ProcessedGoods`.)
+  - **`Luminalia Gift` reconfirmed excluded live**, unchanged from the
+    design plan's research: `commodity_groups: ["ProcessedGoods"]`, still
+    a real, currently-returned catalog entry (not rotated out) — captured
+    verbatim into `tests/fixtures/wiki_commodity_luminalia_gift.json` for
+    the end-to-end exclusion test.
+  - **Spot-checked every excluded group for a wrongly-excluded real
+    material — found none.** All 43 `ProcessedGoods`-only items are
+    genuinely non-repeatable-trade-good (seasonal items like `Luminalia
+    Gift`/`Year of the Rat Envelope`; ship-loot cosmetics like `Ace
+    Interceptor Helmet`/`RS1 Odysey Spacesuits`; quest/mission props like
+    `Evidence Box`/`Organs`; and a handful — `Hydrogen Fuel`, `Quantum
+    Fuel`, `EVA Fuel` — that are ship consumables, not sellable cargo).
+    `Bulk_Supplies` is exactly ship ammo/countermeasures, as the design
+    plan predicted. The four placeholder groups (`Heat`/`Cooler`/`Power:`/
+    `Life Support`) are single-item engine internals, not real goods.
+  - **28 `ProcessedGoods`-tagged commodities correctly still pass**, because
+    they're *dual*-tagged with a second, legitimate group — e.g. `SLAM`,
+    `Stims`, `Neon`, `Distilled Spirits` (`ProcessedGoods` + `Vice`) and
+    `Bioplastic`, `DynaFlex`, `Diamond Laminate` (`ProcessedGoods` +
+    `SyntheticMaterials`) — confirming the OR-semantics design decision
+    (not "all groups must match") was the right call: a strict AND rule
+    would have wrongly excluded every real refined drug and synthetic
+    material in the game.
+  - **Spot-checked every included group** (`Food`, `Organic`, `Vice`,
+    `Metal`, `Mineral`, `Gas`, `Nonmetal`, `Halogen`, `Alloy`, `Waste`,
+    `UnrefinedOres`, `Raw_Minerals`, `SyntheticMaterials`) — all real,
+    recognizable materials/consumables (e.g. `Agricium`, `Laranite`,
+    `Hydrogen`, `Fresh Food`, `Altruciatoxin`, `Scrap`), nothing surprising.
+  - **Surprising, unrelated-to-the-allowlist finding:** two live commodities
+    have an entirely empty `name` field (`""`) — `evidencebox` (excluded,
+    `ProcessedGoods`) and `vipcryopod` (excluded, `CleanAir`); a third,
+    `vlk-limpet` (included, `Organic`), also has an empty `name`. Pre-
+    existing live-API data quality, not something this task's allowlist
+    causes or needs to fix — noted here in case a later task (e.g. a
+    frontend commodity picker) needs to handle a blank display name
+    gracefully.
+  - Locked in for drift detection: `test_refresh.py::
+    test_live_commodity_catalog_allowlist_pass_exclude_counts_in_ballpark`
+    (order-of-magnitude bounds, not exact counts — the live catalog can
+    drift — plus a hard assertion that `luminalia-gift` specifically stays
+    excluded and `laranite` specifically stays included).
 
 ## Standing security ground rules
 

@@ -102,6 +102,25 @@ actually observed empirically, but handled the same way rather than
 silently coerced to `0.0`, which would be indistinguishable from a real
 zero-cargo fighter), upsert by `wiki_uuid` (same stable-internal-id pattern
 as `Terminal`/`Commodity`).
+
+Commodity curation (Phase 2 Task 13)
+--------------------------------------
+Not every entry the wiki API's `/commodities` catalog returns is a real,
+repeatable trade good -- e.g. "Luminalia Gift" (a seasonal-event item) was
+observed producing a nonsensical multi-million-aUEC "profitable" route in
+Phase 1's real-data verification, because the edge-weight formula has no
+way to know it isn't a material. `TRADEABLE_COMMODITY_GROUPS` (module level,
+above) is an allowlist over the wiki API's own `commodity_groups` tag on
+each commodity detail response; `_is_tradeable_commodity` applies it with OR
+semantics (any one matching group is enough) inside `_reconcile`'s main
+commodity loop, *before* a commodity or any of its prices are added to
+`result.commodities`/`result.prices` -- so an excluded commodity never
+reaches the DB at all, and never triggers stub-terminal creation for a
+terminal that would otherwise only be referenced by its (excluded) price
+data. Verified against the real, live catalog (206 commodities as of
+2026-08-15): 157 pass, 49 excluded -- full breakdown, sampled items from
+every included/excluded group, and the live re-confirmation that Luminalia
+Gift is still excluded live in CLAUDE.md's Task 13 addendum.
 """
 
 from __future__ import annotations
@@ -132,6 +151,45 @@ logger = logging.getLogger(__name__)
 #: `RefreshRun.error_message` is truncated to this length before storage, so
 #: a pathological exception message can never bloat the cache DB unbounded.
 _ERROR_MESSAGE_MAX_LENGTH = 2000
+
+#: Commodity curation (Phase 2 Task 13). A commodity is only written to the
+#: `Commodity`/`Price` tables if at least one of its `commodity_groups`
+#: values (OR semantics -- not all groups need to match) is in this set.
+#: These are the wiki API's `commodity_groups` tags that correspond to real,
+#: legitimately-tradeable materials/goods (raw ores, refined
+#: metals/minerals/gases, synthetic materials, and consumables/vice items
+#: players actually run repeatable trade routes with). Everything else
+#: observed live -- `ProcessedGoods` (a mixed bag: some real refined goods,
+#: but also non-commodities like ship-loot cosmetics), `Bulk_Supplies` (ship
+#: ammo/countermeasures), `HeatPlaceholder`/`PowerPlaceholder`/
+#: `LifeSupportPlaceholder`/`CleanAir` (engine placeholders, not real trade
+#: goods) -- stays excluded. This is what keeps a route search from
+#: "profitably" trading a seasonal collectible like Luminalia Gift. Full
+#: empirical justification (live pass/exclude counts, sampled items from
+#: each excluded/included group) lives in CLAUDE.md's Task 13 addendum --
+#: not duplicated here.
+TRADEABLE_COMMODITY_GROUPS = frozenset(
+    {
+        "Metal",
+        "Mineral",
+        "Nonmetal",
+        "Halogen",
+        "Alloy",
+        "Gas",
+        "UnrefinedOres",
+        "Raw_Minerals",
+        "SyntheticMaterials",
+        "Waste",
+        "Food",
+        "Organic",
+        "Vice",
+    }
+)
+
+
+def _is_tradeable_commodity(detail: WikiCommodityDetail) -> bool:
+    """OR-semantics allowlist check: qualifies if *any* group matches."""
+    return not TRADEABLE_COMMODITY_GROUPS.isdisjoint(detail.commodity_groups)
 
 
 # --- public result type -----------------------------------------------------
@@ -410,8 +468,19 @@ def _reconcile(fetched: _FetchedData, settings: Settings) -> _ReconciledData:
         )
 
     # --- commodities + prices, from wiki commodity details ------------------
+    # Curated (Phase 2 Task 13): a commodity outside `TRADEABLE_COMMODITY_
+    # GROUPS` is skipped entirely here -- never written to `result
+    # .commodities`, and its `purchase_entries` are never walked, so it never
+    # reaches `result.prices` either. This is what keeps non-material/
+    # seasonal/placeholder items (e.g. "Luminalia Gift") out of the trade
+    # graph at the source, rather than filtering them at every consumer.
     stub_terminal_ext_ids_seen: set[int] = set()
+    skipped_commodity_count = 0
     for detail in fetched.commodity_details:
+        if not _is_tradeable_commodity(detail):
+            skipped_commodity_count += 1
+            continue
+
         result.commodities[detail.uuid] = _CommodityData(slug=detail.slug, name=detail.name)
 
         for entry in detail.purchase_entries:
@@ -450,6 +519,12 @@ def _reconcile(fetched: _FetchedData, settings: Settings) -> _ReconciledData:
             "refresh: created %d stub terminal(s) for wiki terminal_ids absent from UEX",
             len(stub_terminal_ext_ids_seen),
         )
+    logger.info(
+        "refresh reconcile: commodities kept=%d skipped_by_allowlist=%d (of %d fetched)",
+        len(result.commodities),
+        skipped_commodity_count,
+        len(fetched.commodity_details),
+    )
 
     # --- distances: orbit-pair expansion + same-orbit floor -----------------
     orbit_to_terminal_ext_ids: dict[int, list[int]] = defaultdict(list)

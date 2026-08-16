@@ -25,6 +25,7 @@ from backend.clients.wiki_client import (
     WikiApiClientError,
     WikiApiTransientError,
     WikiClient,
+    WikiCommodityDetail,
     WikiPriceEntry,
     WikiVehicleListItem,
 )
@@ -145,6 +146,10 @@ def test_get_commodity_detail_parses_real_laranite_fixture():
     assert detail.slug == "laranite"
     assert detail.name == "Laranite"
     assert len(detail.purchase_entries) == 26
+    # Real fixture value -- see CLAUDE.md's Task 13 addendum. Round-trips
+    # through `WikiCommodityDetail.commodity_groups` for the allowlist
+    # filter in `backend/ingest/refresh.py` to consume.
+    assert detail.commodity_groups == ["Mineral"]
 
     entry = detail.purchase_entries[0]
     assert entry.terminal_name == "Admin - Stanton Gateway (Nyx)"
@@ -200,6 +205,43 @@ def test_get_commodity_detail_tolerates_sparse_prices():
     assert entry.price_buy == 0.0
     assert entry.price_sell == 4.0
     assert entry.price_rent is None
+
+
+# --- commodity_groups parsing (Phase 2 Task 13) --------------------------
+
+
+@respx.mock
+def test_get_commodity_detail_parses_real_luminalia_gift_fixture():
+    """Real, unmodified capture of a live non-material/seasonal commodity
+    (captured 2026-08-15, see CLAUDE.md's Task 13 addendum) -- `commodity_
+    groups` round-trips as `["ProcessedGoods"]`, which is what `backend/
+    ingest/refresh.py`'s `TRADEABLE_COMMODITY_GROUPS` allowlist uses to
+    exclude it end-to-end (see `tests/integration/test_refresh.py`)."""
+    raw = _load_fixture("wiki_commodity_luminalia_gift.json")
+    respx.get(f"{BASE_URL}/commodities/luminalia-gift").mock(
+        return_value=httpx.Response(200, json=raw)
+    )
+
+    client = WikiClient(settings=_settings())
+    try:
+        detail = client.get_commodity_detail("luminalia-gift")
+    finally:
+        client.close()
+
+    assert detail.slug == "luminalia-gift"
+    assert detail.name == "Luminalia Gift"
+    assert detail.commodity_groups == ["ProcessedGoods"]
+
+
+def test_commodity_detail_defaults_commodity_groups_to_empty_list_when_absent():
+    """Direct model-contract check: a commodity detail payload missing the
+    `commodity_groups` key entirely must parse to `[]`, not crash -- an
+    untagged commodity should fail the allowlist's intersection check
+    (empty groups), not break ingestion."""
+    detail = WikiCommodityDetail.model_validate(
+        {"uuid": "u1", "slug": "untagged", "name": "Untagged Thing"}
+    )
+    assert detail.commodity_groups == []
 
 
 def test_price_entry_never_coerces_missing_price_to_zero():
