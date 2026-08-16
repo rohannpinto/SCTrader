@@ -40,6 +40,7 @@ from backend.models.db import (
     Distance,
     Price,
     RefreshRun,
+    Ship,
     Terminal,
     create_db_engine,
     init_db,
@@ -56,6 +57,13 @@ EXPECTED_TERMINALS = 47
 EXPECTED_COMMODITIES = 3
 EXPECTED_PRICES = 60
 EXPECTED_DISTANCES = 72
+# The mocked /vehicles response (see `_vehicle_list_payload`) carries 4 real
+# vehicle records: Caterpillar and Avenger Stalker are usable real
+# spaceships (is_spaceship=True, quantum_range present); P-52 Merlin is a
+# real spaceship with no quantum drive (quantum_range null -- skipped);
+# Nox is a real non-spaceship ground vehicle (is_spaceship=False --
+# skipped). So 2 usable ships out of 4 raw vehicle records.
+EXPECTED_SHIPS = 2
 
 STANTG_ID = 802  # Nyx, id_orbit 397
 LEVSKI_ID = 778  # Nyx, id_orbit 325
@@ -120,13 +128,37 @@ def _commodity_list_payload() -> dict:
     }
 
 
-def _mock_successful_refresh(*, laranite_payload: dict | None = None) -> None:
+def _vehicle_list_payload() -> dict:
+    """A small, real-data `/vehicles` list page: 2 usable spaceships
+    (Caterpillar, Avenger Stalker), 1 real spaceship with no quantum drive
+    (P-52 Merlin), 1 real non-spaceship ground vehicle (Nox) -- see
+    `EXPECTED_SHIPS`'s comment for why this yields exactly 2 `Ship` rows."""
+    items = []
+    for fixture_name in (
+        "wiki_vehicle_caterpillar.json",
+        "wiki_vehicle_avenger_stalker.json",
+        "wiki_vehicle_p52_merlin.json",
+        "wiki_vehicle_nox.json",
+    ):
+        items.append(_load_fixture(fixture_name)["data"])
+    return {
+        "data": items,
+        "links": {"next": None},
+        "meta": {"current_page": 1, "last_page": 1},
+    }
+
+
+def _mock_successful_refresh(
+    *, laranite_payload: dict | None = None, vehicles_payload: dict | None = None
+) -> None:
     """Registers respx routes for a fully successful refresh, real fixtures.
 
     Must be called inside an active `respx.mock` context. `laranite_payload`
     lets one test substitute a hand-edited copy of the real laranite fixture
     (see `test_missing_price_stays_none_not_coerced_to_zero`) while every
-    other route still serves the pristine, real fixture.
+    other route still serves the pristine, real fixture. `vehicles_payload`
+    is the analogous override for `/vehicles` (see
+    `test_ship_ingestion_is_isolated_from_terminal_reconciliation`).
     """
     respx.get(f"{UEX_BASE}/terminals").mock(
         return_value=httpx.Response(200, json=_load_fixture("uex_terminals_sample.json"))
@@ -159,6 +191,9 @@ def _mock_successful_refresh(*, laranite_payload: dict | None = None) -> None:
     respx.get(f"{UEX_BASE}/orbits_distances", params={"id_star_system": 68}).mock(
         return_value=httpx.Response(200, json=_load_fixture("uex_orbits_distances_stanton.json"))
     )
+    respx.get(f"{WIKI_BASE}/vehicles").mock(
+        return_value=httpx.Response(200, json=vehicles_payload or _vehicle_list_payload())
+    )
 
 
 # --- full successful run ----------------------------------------------------
@@ -176,6 +211,7 @@ def test_full_successful_refresh_counts_and_known_values(engine):
     assert result.commodities_count == EXPECTED_COMMODITIES
     assert result.prices_count == EXPECTED_PRICES
     assert result.distances_count == EXPECTED_DISTANCES
+    assert result.ships_count == EXPECTED_SHIPS
 
     with session_scope(engine) as session:
         run = session.get(RefreshRun, result.run_id)
@@ -187,11 +223,13 @@ def test_full_successful_refresh_counts_and_known_values(engine):
         assert run.commodities_count == EXPECTED_COMMODITIES
         assert run.prices_count == EXPECTED_PRICES
         assert run.distances_count == EXPECTED_DISTANCES
+        assert run.ships_count == EXPECTED_SHIPS
 
         assert session.query(Terminal).count() == EXPECTED_TERMINALS
         assert session.query(Commodity).count() == EXPECTED_COMMODITIES
         assert session.query(Price).count() == EXPECTED_PRICES
         assert session.query(Distance).count() == EXPECTED_DISTANCES
+        assert session.query(Ship).count() == EXPECTED_SHIPS
 
         # STANTG <-> LEVSKI: CLAUDE.md's join example, real fixture value.
         stantg = session.query(Terminal).filter_by(uex_terminal_id=STANTG_ID).one()
@@ -288,6 +326,7 @@ def test_running_refresh_twice_is_idempotent(engine):
     with session_scope(engine) as session:
         terminal_ids_after_first = {t.uex_terminal_id: t.id for t in session.query(Terminal).all()}
         commodity_ids_after_first = {c.wiki_uuid: c.id for c in session.query(Commodity).all()}
+        ship_ids_after_first = {s.wiki_uuid: s.id for s in session.query(Ship).all()}
 
     second = run_refresh(engine=engine, settings=_settings())
     assert second.status == "success"
@@ -297,21 +336,118 @@ def test_running_refresh_twice_is_idempotent(engine):
     assert second.commodities_count == first.commodities_count == EXPECTED_COMMODITIES
     assert second.prices_count == first.prices_count == EXPECTED_PRICES
     assert second.distances_count == first.distances_count == EXPECTED_DISTANCES
+    assert second.ships_count == first.ships_count == EXPECTED_SHIPS
 
     with session_scope(engine) as session:
         assert session.query(Terminal).count() == EXPECTED_TERMINALS
         assert session.query(Commodity).count() == EXPECTED_COMMODITIES
         assert session.query(Price).count() == EXPECTED_PRICES
         assert session.query(Distance).count() == EXPECTED_DISTANCES
+        assert session.query(Ship).count() == EXPECTED_SHIPS
 
         terminal_ids_after_second = {t.uex_terminal_id: t.id for t in session.query(Terminal).all()}
         commodity_ids_after_second = {c.wiki_uuid: c.id for c in session.query(Commodity).all()}
+        ship_ids_after_second = {s.wiki_uuid: s.id for s in session.query(Ship).all()}
 
     # Internal ids stable across refreshes -- upsert, not insert-duplicate.
     assert terminal_ids_after_second == terminal_ids_after_first
     assert commodity_ids_after_second == commodity_ids_after_first
+    assert ship_ids_after_second == ship_ids_after_first
     # A second RefreshRun row was recorded, distinct from the first.
     assert second.run_id != first.run_id
+
+
+# --- ship ingestion (Task 11) ------------------------------------------------
+
+
+@respx.mock
+def test_ship_ingestion_filters_and_converts_real_vehicle_data(engine, caplog):
+    """End-to-end: real vehicle fixtures -> filtered, converted `Ship` rows.
+
+    Exercises the exact filter from `wiki_client.py`'s "Vehicles listing"
+    docstring against real captured data: 2 usable spaceships kept
+    (Caterpillar, Avenger Stalker), 1 real spaceship with no quantum drive
+    skipped with a warning (P-52 Merlin), 1 real non-spaceship ground
+    vehicle skipped silently (Nox).
+    """
+    with caplog.at_level(logging.WARNING, logger="backend.ingest.refresh"):
+        _mock_successful_refresh()
+        result = run_refresh(engine=engine, settings=_settings())
+
+    assert result.status == "success"
+    assert result.ships_count == EXPECTED_SHIPS
+    # The skip is logged with the real vehicle's name, not silently dropped.
+    assert any("P-52 Merlin" in message for message in caplog.messages)
+
+    with session_scope(engine) as session:
+        assert session.query(Ship).count() == EXPECTED_SHIPS
+
+        caterpillar = session.query(Ship).filter_by(name="Caterpillar").one()
+        assert caterpillar.manufacturer_name == "Drake Interplanetary"
+        assert caterpillar.cargo_capacity_scu == 576.0
+        # 70284406669 meters / 1e9 -- exact conversion, real fixture value.
+        assert caterpillar.quantum_range_gm == pytest.approx(70.284406669)
+
+        avenger = session.query(Ship).filter_by(name="Avenger Stalker").one()
+        # A real fighter with a genuine zero cargo capacity -- kept, not
+        # skipped or coerced to something else.
+        assert avenger.cargo_capacity_scu == 0.0
+
+        assert session.query(Ship).filter_by(name="P-52 Merlin").one_or_none() is None
+        assert session.query(Ship).filter_by(name="Nox").one_or_none() is None
+
+
+@respx.mock
+def test_ship_ingestion_skips_spaceship_with_null_cargo_capacity(engine, caplog):
+    """A real spaceship (Avenger Stalker, which normally has usable
+    `quantum_range` data) with a hand-edited `cargo_capacity: null` must be
+    skipped -- logged with a warning, same as the `quantum_range: null`
+    case -- never silently coerced to `0.0`, which would be
+    indistinguishable from a genuine zero-cargo fighter (see CLAUDE.md's
+    Task 11 addendum)."""
+    mutated_avenger = json.loads(json.dumps(_load_fixture("wiki_vehicle_avenger_stalker.json")))["data"]
+    assert mutated_avenger["cargo_capacity"] == 0  # sanity: real value before mutation
+    mutated_avenger["cargo_capacity"] = None
+
+    vehicles_payload = _vehicle_list_payload()
+    for item in vehicles_payload["data"]:
+        if item["uuid"] == mutated_avenger["uuid"]:
+            item["cargo_capacity"] = None
+
+    with caplog.at_level(logging.WARNING, logger="backend.ingest.refresh"):
+        _mock_successful_refresh(vehicles_payload=vehicles_payload)
+        result = run_refresh(engine=engine, settings=_settings())
+
+    assert result.status == "success"
+    # One fewer than the normal EXPECTED_SHIPS (Avenger Stalker excluded).
+    assert result.ships_count == EXPECTED_SHIPS - 1
+    assert any("Avenger Stalker" in message for message in caplog.messages)
+    assert any("cargo_capacity" in message for message in caplog.messages)
+
+    with session_scope(engine) as session:
+        assert session.query(Ship).filter_by(name="Avenger Stalker").one_or_none() is None
+        # Caterpillar (unaffected, real cargo=576) is still ingested normally.
+        caterpillar = session.query(Ship).filter_by(name="Caterpillar").one()
+        assert caterpillar.cargo_capacity_scu == 576.0
+
+
+@respx.mock
+def test_ship_ingestion_is_isolated_from_terminal_reconciliation(engine):
+    """A broken/empty `/vehicles` response must not affect terminal,
+    commodity, price, or distance ingestion at all -- confirms the ship
+    phase is genuinely structurally separate, not entangled with
+    `_reconcile`'s terminal-handling code."""
+    empty_vehicles = {"data": [], "links": {"next": None}, "meta": {"current_page": 1, "last_page": 1}}
+    _mock_successful_refresh(vehicles_payload=empty_vehicles)
+
+    result = run_refresh(engine=engine, settings=_settings())
+
+    assert result.status == "success"
+    assert result.ships_count == 0
+    assert result.terminals_count == EXPECTED_TERMINALS
+    assert result.commodities_count == EXPECTED_COMMODITIES
+    assert result.prices_count == EXPECTED_PRICES
+    assert result.distances_count == EXPECTED_DISTANCES
 
 
 # --- wiki-terminal-not-in-UEX-list stub edge case ----------------------------
@@ -366,6 +502,7 @@ def test_failed_refresh_leaves_prior_data_untouched(engine):
     with session_scope(engine) as session:
         terminal_ids_before = {t.uex_terminal_id: t.id for t in session.query(Terminal).all()}
         commodity_ids_before = {c.wiki_uuid: c.id for c in session.query(Commodity).all()}
+        ship_ids_before = {s.wiki_uuid: s.id for s in session.query(Ship).all()}
         prices_before = session.query(Price).count()
         distances_before = session.query(Distance).count()
         refresh_runs_before = session.query(RefreshRun).count()
@@ -389,6 +526,7 @@ def test_failed_refresh_leaves_prior_data_untouched(engine):
     assert second.commodities_count is None
     assert second.prices_count is None
     assert second.distances_count is None
+    assert second.ships_count is None
 
     with session_scope(engine) as session:
         run = session.get(RefreshRun, second.run_id)
@@ -401,5 +539,6 @@ def test_failed_refresh_leaves_prior_data_untouched(engine):
         assert session.query(RefreshRun).count() == refresh_runs_before + 1
         assert {t.uex_terminal_id: t.id for t in session.query(Terminal).all()} == terminal_ids_before
         assert {c.wiki_uuid: c.id for c in session.query(Commodity).all()} == commodity_ids_before
+        assert {s.wiki_uuid: s.id for s in session.query(Ship).all()} == ship_ids_before
         assert session.query(Price).count() == prices_before
         assert session.query(Distance).count() == distances_before

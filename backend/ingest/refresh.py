@@ -70,6 +70,24 @@ UEX's `id_orbit: 0` sentinel ("no parent orbit on record", e.g. terminal 422
 (`_normalize_id_orbit`) so it behaves identically to a genuinely-unknown
 orbit rather than being treated as a real orbit shared by every other
 `id_orbit: 0` terminal.
+
+Ship ingestion (Task 11)
+--------------------------
+A genuinely separate phase from the terminal/commodity/price/distance
+pipeline above -- its own fetch (`_fetch_ships`), reconcile
+(`_reconcile_ships`), and write (`_upsert_ships`) functions, touching none
+of `_reconcile`'s terminal-handling code. Source is
+`WikiClient.list_all_vehicles()`; filter and rationale are documented in
+that client's module docstring ("Vehicles listing") and CLAUDE.md's Task 11
+addendum -- summary: keep only `is_spaceship=True` vehicles with both a
+non-null `quantum.quantum_range` (meters, converted to gigameters via
+`/ 1e9` here) and a non-null `cargo_capacity`, skipping and logging a
+warning for every real spaceship missing either (quantum: a small minority
+-- craft with no quantum drive at all, e.g. the P-52 Merlin; cargo: never
+actually observed empirically, but handled the same way rather than
+silently coerced to `0.0`, which would be indistinguishable from a real
+zero-cargo fighter), upsert by `wiki_uuid` (same stable-internal-id pattern
+as `Terminal`/`Commodity`).
 """
 
 from __future__ import annotations
@@ -83,13 +101,14 @@ from typing import Optional
 from sqlalchemy import Engine, delete, select
 
 from backend.clients.uex_client import UexClient, UexOrbitDistance, UexTerminal
-from backend.clients.wiki_client import WikiClient, WikiCommodityDetail
+from backend.clients.wiki_client import WikiClient, WikiCommodityDetail, WikiVehicleListItem
 from backend.config import Settings, get_settings
 from backend.models.db import (
     Commodity,
     Distance,
     Price,
     RefreshRun,
+    Ship,
     Terminal,
     session_scope,
 )
@@ -119,6 +138,7 @@ class RefreshResult:
     terminals_count: Optional[int] = None
     prices_count: Optional[int] = None
     distances_count: Optional[int] = None
+    ships_count: Optional[int] = None
     error_message: Optional[str] = None
 
     @property
@@ -134,14 +154,26 @@ class _FetchedData:
     uex_terminals: list[UexTerminal]
     commodity_details: list[WikiCommodityDetail]
     orbit_distances: list[UexOrbitDistance]
+    vehicles: list[WikiVehicleListItem]
+
+
+def _fetch_ships(wiki: WikiClient) -> list[WikiVehicleListItem]:
+    """Fetch every vehicle list item. Separate function (not inlined into
+    `_fetch_all`) so ship fetching stays its own isolated step, mirroring
+    how `_reconcile_ships`/`_upsert_ships` stay isolated in the later
+    phases -- see module docstring's "Ship ingestion" section.
+    """
+    vehicles = wiki.list_all_vehicles()
+    logger.info("refresh fetch: vehicles=%d", len(vehicles))
+    return vehicles
 
 
 def _fetch_all(wiki: WikiClient, uex: UexClient) -> _FetchedData:
     """Phase 1: fetch every input this refresh needs, with zero DB writes.
 
-    If any of the three fetch steps raises, the exception propagates
-    straight out -- the caller (`run_refresh`) never reaches phase 3, so the
-    on-disk cache is left completely untouched.
+    If any of the fetch steps raises, the exception propagates straight out
+    -- the caller (`run_refresh`) never reaches phase 3, so the on-disk
+    cache is left completely untouched.
     """
     uex_terminals = uex.list_terminals()
     commodity_type_counts = sum(1 for t in uex_terminals if t.type == "commodity")
@@ -156,10 +188,13 @@ def _fetch_all(wiki: WikiClient, uex: UexClient) -> _FetchedData:
     orbit_distances = uex.list_all_orbit_distances()
     logger.info("refresh fetch: orbit_distance_rows=%d", len(orbit_distances))
 
+    vehicles = _fetch_ships(wiki)
+
     return _FetchedData(
         uex_terminals=uex_terminals,
         commodity_details=commodity_details,
         orbit_distances=orbit_distances,
+        vehicles=vehicles,
     )
 
 
@@ -197,12 +232,23 @@ class _PriceData:
 
 
 @dataclass
+class _ShipData:
+    """Desired state for one `Ship` row, keyed by `wiki_uuid` upstream."""
+
+    name: str
+    manufacturer_name: Optional[str]
+    quantum_range_gm: float
+    cargo_capacity_scu: float
+
+
+@dataclass
 class _ReconciledData:
     terminals: dict[int, _TerminalData] = field(default_factory=dict)
     commodities: dict[str, _CommodityData] = field(default_factory=dict)
     prices: dict[tuple[int, str], _PriceData] = field(default_factory=dict)
     # (terminal_a_ext_id, terminal_b_ext_id) -> distance
     distances: dict[tuple[int, int], float] = field(default_factory=dict)
+    ships: dict[str, _ShipData] = field(default_factory=dict)
 
 
 def _normalize_id_orbit(raw_id_orbit: Optional[int]) -> Optional[int]:
@@ -235,6 +281,84 @@ def _pick_location_name(terminal: UexTerminal) -> Optional[str]:
         if candidate:
             return candidate
     return None
+
+
+#: `WikiVehicleListItem.quantum_range_m` is in meters; the `Ship` table (and
+#: the existing `Distance` table) store gigameters.
+_METERS_PER_GIGAMETER = 1e9
+
+
+def _reconcile_ships(vehicles: list[WikiVehicleListItem]) -> dict[str, _ShipData]:
+    """Filter + convert the raw vehicle list into desired `Ship` rows.
+
+    Standalone function, deliberately separate from `_reconcile`'s
+    terminal/commodity/price/distance logic -- see module docstring's "Ship
+    ingestion" section. Keeps only real player spaceships with usable
+    quantum-drive *and* cargo data (`is_spaceship=True`, `quantum_range_m`
+    non-null, `cargo_capacity` non-null -- see `wiki_client.py`'s "Vehicles
+    listing" docstring for the empirical basis), logging a warning for each
+    real spaceship skipped for either reason. A real, present `0` for
+    `cargo_capacity` (a pure fighter with no cargo grid -- common,
+    empirically ~half of real ships) is kept as-is, not skipped: only an
+    actually-missing (`None`) value is treated as unusable, same
+    missing-vs-zero distinction CLAUDE.md's edge-weight formula draws for
+    prices. Non-spaceships (ground vehicles, gravlev, power suits) are
+    skipped silently -- that's the expected, routine case, not a
+    data-quality problem worth a warning.
+    """
+    ships: dict[str, _ShipData] = {}
+    skipped_missing_quantum = 0
+    skipped_missing_cargo = 0
+
+    for vehicle in vehicles:
+        if not vehicle.is_spaceship:
+            continue
+
+        quantum_range_m = vehicle.quantum_range_m
+        if quantum_range_m is None:
+            skipped_missing_quantum += 1
+            logger.warning(
+                "refresh: skipping spaceship uuid=%s name=%s -- no usable quantum_range data",
+                vehicle.uuid,
+                vehicle.name,
+            )
+            continue
+
+        if vehicle.cargo_capacity is None:
+            skipped_missing_cargo += 1
+            logger.warning(
+                "refresh: skipping spaceship uuid=%s name=%s -- no usable cargo_capacity data",
+                vehicle.uuid,
+                vehicle.name,
+            )
+            continue
+
+        ships[vehicle.uuid] = _ShipData(
+            name=vehicle.name,
+            manufacturer_name=vehicle.manufacturer_name,
+            quantum_range_gm=quantum_range_m / _METERS_PER_GIGAMETER,
+            cargo_capacity_scu=vehicle.cargo_capacity,
+        )
+
+    if skipped_missing_quantum:
+        logger.warning(
+            "refresh: skipped %d spaceship(s) with no usable quantum_range data",
+            skipped_missing_quantum,
+        )
+    if skipped_missing_cargo:
+        logger.warning(
+            "refresh: skipped %d spaceship(s) with no usable cargo_capacity data",
+            skipped_missing_cargo,
+        )
+    logger.info(
+        "refresh reconcile: ships=%d (skipped_missing_quantum=%d, skipped_missing_cargo=%d, "
+        "from %d total vehicles)",
+        len(ships),
+        skipped_missing_quantum,
+        skipped_missing_cargo,
+        len(vehicles),
+    )
+    return ships
 
 
 def _reconcile(fetched: _FetchedData, settings: Settings) -> _ReconciledData:
@@ -324,13 +448,17 @@ def _reconcile(fetched: _FetchedData, settings: Settings) -> _ReconciledData:
                 if x != y:
                     result.distances[(x, y)] = floor
 
+    # --- ships: a fully separate reconciliation step, see `_reconcile_ships` ---
+    result.ships = _reconcile_ships(fetched.vehicles)
+
     logger.info(
-        "refresh reconcile: terminals=%d (stubs=%d) commodities=%d prices=%d distances=%d",
+        "refresh reconcile: terminals=%d (stubs=%d) commodities=%d prices=%d distances=%d ships=%d",
         len(result.terminals),
         len(stub_terminal_ext_ids_seen),
         len(result.commodities),
         len(result.prices),
         len(result.distances),
+        len(result.ships),
     )
     return result
 
@@ -344,6 +472,7 @@ class _WriteCounts:
     commodities: int
     prices: int
     distances: int
+    ships: int
 
 
 def _upsert_terminals_and_commodities(
@@ -395,6 +524,30 @@ def _upsert_terminals_and_commodities(
     # assigned before Price/Distance rows below need to reference them.
     session.flush()
     return terminal_rows_by_ext_id, commodity_rows_by_uuid
+
+
+def _upsert_ships(session, reconciled: _ReconciledData) -> int:
+    """Upsert `Ship` rows by `wiki_uuid`, keeping internal `id`s stable.
+
+    A fully separate write step from `_upsert_terminals_and_commodities`
+    (not folded into it) -- see module docstring's "Ship ingestion"
+    section. Same upsert-by-external-key shape as that function, applied to
+    `Ship`/`wiki_uuid` instead of `Terminal`/`Commodity`.
+    """
+    existing_ship_rows: dict[str, Ship] = {
+        row.wiki_uuid: row for row in session.execute(select(Ship)).scalars()
+    }
+    for wiki_uuid, data in reconciled.ships.items():
+        row = existing_ship_rows.get(wiki_uuid)
+        if row is None:
+            row = Ship(wiki_uuid=wiki_uuid)
+            session.add(row)
+        row.name = data.name
+        row.manufacturer_name = data.manufacturer_name
+        row.quantum_range_gm = data.quantum_range_gm
+        row.cargo_capacity_scu = data.cargo_capacity_scu
+
+    return len(reconciled.ships)
 
 
 def _replace_prices(
@@ -451,11 +604,13 @@ def _replace_distances(
 
 
 def _write_all(engine: Optional[Engine], reconciled: _ReconciledData, fetched_at: datetime) -> _WriteCounts:
-    """Phase 3: upsert terminals/commodities, replace-all prices/distances.
+    """Phase 3: upsert terminals/commodities/ships, replace-all prices/distances.
 
     All of it happens inside one `session_scope()` -- commits together, or
     (via `session_scope`'s existing rollback-on-exception behavior) none of
-    it does.
+    it does. `_upsert_ships` is called alongside, not folded into,
+    `_upsert_terminals_and_commodities` -- see module docstring's "Ship
+    ingestion" section.
     """
     with session_scope(engine) as session:
         terminal_rows_by_ext_id, commodity_rows_by_uuid = _upsert_terminals_and_commodities(
@@ -465,19 +620,22 @@ def _write_all(engine: Optional[Engine], reconciled: _ReconciledData, fetched_at
             session, reconciled, terminal_rows_by_ext_id, commodity_rows_by_uuid, fetched_at
         )
         distances_count = _replace_distances(session, reconciled, terminal_rows_by_ext_id, fetched_at)
+        ships_count = _upsert_ships(session, reconciled)
         counts = _WriteCounts(
             terminals=len(terminal_rows_by_ext_id),
             commodities=len(commodity_rows_by_uuid),
             prices=prices_count,
             distances=distances_count,
+            ships=ships_count,
         )
 
     logger.info(
-        "refresh write: terminals=%d commodities=%d prices=%d distances=%d",
+        "refresh write: terminals=%d commodities=%d prices=%d distances=%d ships=%d",
         counts.terminals,
         counts.commodities,
         counts.prices,
         counts.distances,
+        counts.ships,
     )
     return counts
 
@@ -567,14 +725,16 @@ def run_refresh(
         run.terminals_count = counts.terminals
         run.prices_count = counts.prices
         run.distances_count = counts.distances
+        run.ships_count = counts.ships
 
     logger.info(
-        "refresh run_id=%d succeeded terminals=%d commodities=%d prices=%d distances=%d",
+        "refresh run_id=%d succeeded terminals=%d commodities=%d prices=%d distances=%d ships=%d",
         run_id,
         counts.terminals,
         counts.commodities,
         counts.prices,
         counts.distances,
+        counts.ships,
     )
     return RefreshResult(
         run_id=run_id,
@@ -583,4 +743,5 @@ def run_refresh(
         terminals_count=counts.terminals,
         prices_count=counts.prices,
         distances_count=counts.distances,
+        ships_count=counts.ships,
     )

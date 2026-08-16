@@ -18,6 +18,7 @@ from backend.models.db import (
     Distance,
     Price,
     RefreshRun,
+    Ship,
     Terminal,
     create_db_engine,
     get_current_data_version,
@@ -48,7 +49,14 @@ def test_init_db_creates_all_tables(engine):
 
     inspector = inspect(engine)
     table_names = set(inspector.get_table_names())
-    assert {"commodities", "terminals", "prices", "distances", "refresh_runs"} <= table_names
+    assert {
+        "commodities",
+        "terminals",
+        "prices",
+        "distances",
+        "refresh_runs",
+        "ships",
+    } <= table_names
 
 
 # --- WAL mode -------------------------------------------------------------
@@ -109,6 +117,72 @@ def test_commodity_wiki_uuid_uniqueness_enforced(engine):
     with pytest.raises(IntegrityError):
         with session_scope(engine) as session:
             session.add(Commodity(wiki_uuid="uuid-1", slug="laranite-2", name="Laranite Dup"))
+
+
+# --- Ship uniqueness (Task 11) ---------------------------------------------
+
+
+def test_ship_wiki_uuid_uniqueness_enforced(engine):
+    with session_scope(engine) as session:
+        session.add(
+            Ship(
+                wiki_uuid="ship-uuid-1",
+                name="Caterpillar",
+                manufacturer_name="Drake Interplanetary",
+                quantum_range_gm=70.284406669,
+                cargo_capacity_scu=576.0,
+            )
+        )
+
+    with pytest.raises(IntegrityError):
+        with session_scope(engine) as session:
+            session.add(
+                Ship(
+                    wiki_uuid="ship-uuid-1",
+                    name="Caterpillar Dup",
+                    manufacturer_name="Drake Interplanetary",
+                    quantum_range_gm=70.284406669,
+                    cargo_capacity_scu=576.0,
+                )
+            )
+
+
+def test_ship_allows_null_manufacturer_and_zero_cargo(engine):
+    # `manufacturer_name` is nullable; `cargo_capacity_scu=0.0` is a real,
+    # common value (a pure fighter with no cargo grid) -- not a rejected or
+    # coerced-away state.
+    with session_scope(engine) as session:
+        session.add(
+            Ship(
+                wiki_uuid="ship-uuid-2",
+                name="Avenger Stalker",
+                manufacturer_name=None,
+                quantum_range_gm=112.244897959,
+                cargo_capacity_scu=0.0,
+            )
+        )
+
+    with session_scope(engine) as session:
+        ship = session.query(Ship).filter_by(wiki_uuid="ship-uuid-2").one()
+        assert ship.manufacturer_name is None
+        assert ship.cargo_capacity_scu == 0.0
+
+
+def test_ship_id_stable_surrogate_key_distinct_from_wiki_uuid(engine):
+    with session_scope(engine) as session:
+        session.add(
+            Ship(
+                wiki_uuid="ship-uuid-3",
+                name="Freelancer",
+                manufacturer_name="MISC",
+                quantum_range_gm=100.0,
+                cargo_capacity_scu=66.0,
+            )
+        )
+
+    with session_scope(engine) as session:
+        ship = session.query(Ship).filter_by(wiki_uuid="ship-uuid-3").one()
+        assert isinstance(ship.id, int)
 
 
 # --- Price composite PK ---------------------------------------------------

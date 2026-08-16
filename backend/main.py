@@ -30,6 +30,7 @@ from backend.models.db import init_db
 from backend.rate_limit import limiter
 from backend.routers import refresh as refresh_router
 from backend.routers import route as route_router
+from backend.routers import ships as ships_router
 from backend.routers import terminals as terminals_router
 
 setup_logging()
@@ -98,3 +99,4 @@ def health() -> dict[str, str]:
 app.include_router(terminals_router.router)
 app.include_router(refresh_router.router)
 app.include_router(route_router.router)
+app.include_router(ships_router.router)

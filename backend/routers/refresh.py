@@ -67,6 +67,7 @@ def _run_to_status_out(run: RefreshRun, snapshot: GraphCacheSnapshot) -> Refresh
         terminals_count=run.terminals_count,
         prices_count=run.prices_count,
         distances_count=run.distances_count,
+        ships_count=run.ships_count,
         error_message=run.error_message,
         data_version=snapshot.data_version,
         warnings=snapshot.warnings,

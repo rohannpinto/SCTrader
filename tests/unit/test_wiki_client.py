@@ -26,6 +26,7 @@ from backend.clients.wiki_client import (
     WikiApiTransientError,
     WikiClient,
     WikiPriceEntry,
+    WikiVehicleListItem,
 )
 from backend.config import Settings
 
@@ -391,6 +392,225 @@ def test_follows_redirect_transparently(no_real_sleep):
     assert no_real_sleep == []
 
 
+# --- vehicles listing (Task 11) ------------------------------------------
+
+
+@respx.mock
+def test_list_all_vehicles_follows_pagination_to_completion():
+    # Page 1 is the real, verbatim captured fixture (5 items, real
+    # `links.next` pointing at page 2 -- captured with `page[size]=5` so a
+    # small real page could be recorded, same rationale as the commodities
+    # pagination test). Real captured `links.next` here is an absolute
+    # `http://` URL (the same live-API quirk `wiki_client.py`'s "redirect
+    # handling" section documents for `/commodities`, confirmed to also
+    # apply to `/vehicles`) -- the live API 301-redirects it to `https://`,
+    # so that redirect hop is mocked explicitly rather than assuming an
+    # exact URL match. Page 2 (the `https://` target) is a small
+    # schema-accurate synthetic continuation terminating the loop.
+    page1 = _load_fixture("wiki_vehicles_list_page1.json")
+    assert page1["links"]["next"].startswith("http://")  # sanity: still the real quirk
+    http_next_url = page1["links"]["next"]
+    https_next_url = http_next_url.replace("http://", "https://", 1)
+    page2 = {
+        "data": [
+            {
+                "uuid": "uuid-synthetic-1",
+                "name": "Synthetic Ship",
+                "is_spaceship": True,
+                "manufacturer": {"name": "Synthetic Corp", "code": "SYN"},
+                "quantum": {"quantum_range": 50000000000},
+                "cargo_capacity": 10,
+            }
+        ],
+        "links": {"next": None},
+        "meta": {"current_page": 2, "last_page": 2},
+    }
+    # respx's `params=` matcher is a *contains* check, not an exact match --
+    # `page1_route`'s `page[size]=5` requirement is also satisfied by
+    # `page2_route`'s URL (which has `page[size]=5` *and* `page[number]=2`).
+    # respx resolves ambiguous matches in registration order, so the more
+    # specific routes (`redirect_route`, `page2_route`) are registered
+    # *before* the broader `page1_route` -- registering them in the other
+    # order made `page1_route` win every time, including for the page-2
+    # request, which looped forever (`page1`'s own `links.next` pointing
+    # right back at itself).
+    redirect_route = respx.get(http_next_url).mock(
+        return_value=httpx.Response(301, headers={"Location": https_next_url})
+    )
+    page2_route = respx.get(https_next_url).mock(return_value=httpx.Response(200, json=page2))
+    page1_route = respx.get(f"{BASE_URL}/vehicles", params={"page[size]": "5"}).mock(
+        return_value=httpx.Response(200, json=page1)
+    )
+
+    client = WikiClient(settings=_settings())
+    try:
+        items = client.list_all_vehicles(page_size=5)
+    finally:
+        client.close()
+
+    assert page1_route.call_count == 1
+    assert redirect_route.call_count == 1
+    assert page2_route.call_count == 1
+    assert len(items) == 5 + 1
+    # First item comes from the real fixture, verbatim.
+    assert items[0].name == "Avenger Stalker"
+    assert items[0].uuid == "97648869-5fa5-42da-b804-4d9314289539"
+    assert items[0].is_spaceship is True
+    assert items[0].manufacturer_name == "Aegis Dynamics"
+    assert items[0].quantum_range_m == 112244897959
+    assert items[0].cargo_capacity == 0
+    # Last item comes from the synthetic terminating page.
+    assert items[-1].name == "Synthetic Ship"
+
+
+@respx.mock
+def test_iter_vehicles_stops_when_links_next_is_null():
+    page1 = {
+        "data": [
+            {
+                "uuid": "uuid-a",
+                "name": "A",
+                "is_spaceship": True,
+                "manufacturer": {"name": "Mfr"},
+                "quantum": {"quantum_range": 1000000000},
+                "cargo_capacity": 1,
+            }
+        ],
+        "links": {"next": None},
+        "meta": {"current_page": 1, "last_page": 1},
+    }
+    route = respx.get(f"{BASE_URL}/vehicles").mock(return_value=httpx.Response(200, json=page1))
+
+    client = WikiClient(settings=_settings())
+    try:
+        items = list(client.iter_vehicles())
+    finally:
+        client.close()
+
+    assert route.call_count == 1
+    assert len(items) == 1
+
+
+@respx.mock
+def test_iter_vehicles_parses_real_caterpillar_full_data():
+    """A real spaceship with full, usable quantum + cargo data."""
+    raw = _load_fixture("wiki_vehicle_caterpillar.json")["data"]
+    respx.get(f"{BASE_URL}/vehicles").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": [raw],
+                "links": {"next": None},
+                "meta": {"current_page": 1, "last_page": 1},
+            },
+        )
+    )
+
+    client = WikiClient(settings=_settings())
+    try:
+        items = list(client.iter_vehicles())
+    finally:
+        client.close()
+
+    assert len(items) == 1
+    ship = items[0]
+    assert ship.name == "Caterpillar"
+    assert ship.is_spaceship is True
+    assert ship.manufacturer_name == "Drake Interplanetary"
+    assert ship.quantum_range_m == 70284406669
+    assert ship.cargo_capacity == 576
+
+
+@respx.mock
+def test_iter_vehicles_tolerates_real_spaceship_missing_quantum_range():
+    """Real edge case: a genuine spaceship (P-52 Merlin) with no quantum
+    drive -- `quantum` is present but `quantum.quantum_range` is `null`.
+    Must parse cleanly to `None`, not crash."""
+    raw = _load_fixture("wiki_vehicle_p52_merlin.json")["data"]
+    respx.get(f"{BASE_URL}/vehicles").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": [raw],
+                "links": {"next": None},
+                "meta": {"current_page": 1, "last_page": 1},
+            },
+        )
+    )
+
+    client = WikiClient(settings=_settings())
+    try:
+        items = list(client.iter_vehicles())
+    finally:
+        client.close()
+
+    assert len(items) == 1
+    ship = items[0]
+    assert ship.name == "P-52 Merlin"
+    assert ship.is_spaceship is True
+    assert ship.quantum_range_m is None
+
+
+@respx.mock
+def test_iter_vehicles_parses_real_non_spaceship_ground_vehicle():
+    """Real edge case: a non-spaceship "vehicle" (Nox, a gravlev ground
+    vehicle) -- `is_spaceship` is `False` and `quantum_range` is `null`,
+    confirming the filter data ingestion relies on is present and correct."""
+    raw = _load_fixture("wiki_vehicle_nox.json")["data"]
+    respx.get(f"{BASE_URL}/vehicles").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": [raw],
+                "links": {"next": None},
+                "meta": {"current_page": 1, "last_page": 1},
+            },
+        )
+    )
+
+    client = WikiClient(settings=_settings())
+    try:
+        items = list(client.iter_vehicles())
+    finally:
+        client.close()
+
+    assert len(items) == 1
+    vehicle = items[0]
+    assert vehicle.name == "Nox"
+    assert vehicle.is_spaceship is False
+    assert vehicle.quantum_range_m is None
+
+
+def test_vehicle_list_item_never_defaults_missing_quantum_to_zero():
+    """Direct model-contract check: `quantum_range_m` must stay `None` when
+    `quantum` itself is entirely absent from the payload, matching the
+    `is_spaceship=False` / no-quantum-drive-spaceship cases above."""
+    item = WikiVehicleListItem.model_validate(
+        {"uuid": "u1", "name": "No Quantum Object At All", "is_spaceship": True}
+    )
+    assert item.quantum_range_m is None
+    assert item.manufacturer_name is None
+    assert item.cargo_capacity is None
+
+
+def test_vehicle_list_item_parses_null_cargo_capacity_as_none_not_zero():
+    """Direct model-contract check: an explicit JSON `null` for
+    `cargo_capacity` must parse to `None`, not `0.0` -- the ingestion
+    filter (`backend/ingest/refresh.py`'s `_reconcile_ships`) relies on
+    this client-level distinction to decide whether to skip the ship."""
+    item = WikiVehicleListItem.model_validate(
+        {
+            "uuid": "u2",
+            "name": "Null Cargo Capacity Ship",
+            "is_spaceship": True,
+            "quantum": {"quantum_range": 50000000000},
+            "cargo_capacity": None,
+        }
+    )
+    assert item.cargo_capacity is None
+    assert item.quantum_range_m == 50000000000
+
+
 # --- live smoke test (excluded by default; run with `pytest -m live`) --
 
 
@@ -414,3 +634,29 @@ def test_live_get_commodity_detail_laranite_smoke():
     assert entry.terminal_id is not None
     assert entry.terminal_name
     assert entry.price_buy is not None or entry.price_sell is not None
+
+
+@pytest.mark.live
+def test_live_list_all_vehicles_smoke():
+    """Hits the real API once, paginating the full `/vehicles` listing.
+
+    Not a correctness test -- an early warning for schema drift on this
+    specific client (Task 11's research spike shape). Excluded from the
+    default run. Confirms: pagination completes, at least one real
+    spaceship with usable quantum data is present, and `is_spaceship=False`
+    vehicles (if any appear) never carry a non-null `quantum_range`.
+    """
+    client = WikiClient()
+    try:
+        items = client.list_all_vehicles()
+    finally:
+        client.close()
+
+    assert len(items) > 0
+    spaceships_with_range = [
+        i for i in items if i.is_spaceship and i.quantum_range_m is not None
+    ]
+    assert len(spaceships_with_range) > 0
+    for item in items:
+        if not item.is_spaceship:
+            assert item.quantum_range_m is None

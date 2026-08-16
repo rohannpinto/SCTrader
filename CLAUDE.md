@@ -244,6 +244,41 @@ shared-context summary.
   direction) — store/look up both directions rather than assuming
   symmetry. `UexClient.iter_all_orbit_distances()` /
   `.list_all_orbit_distances()` implement this bulk strategy end to end.
+- **Vehicles bulk listing (Task 11, `wiki_client.py`'s `iter_vehicles`/
+  `list_all_vehicles`):** `GET /vehicles` uses the exact same Laravel-style
+  paginated envelope and page-size clamp (observed max `200`) as
+  `/commodities` — but, unlike `/commodities`, each list item is already
+  the **full** vehicle record (`quantum`, `cargo_capacity`, `manufacturer`,
+  and everything else a per-item detail call would also return), so there
+  is no separate detail-fetch step for ingestion to do. 295 total vehicles
+  across 2 pages at the clamped size, as of the capture date (2026-08-15).
+  Filter for the `Ship` table, verified against all 295: keep
+  `is_spaceship == true` **and** `quantum.quantum_range` non-null. Of 295
+  vehicles, 247 have `is_spaceship: true`; the other 48 (ground vehicles,
+  gravlev craft, power-suit "vehicles") all have `quantum.quantum_range:
+  null`, with no exceptions, confirming `is_spaceship` alone is a reliable
+  gate. Of the 247 real spaceships, 10 have `quantum.quantum_range: null`
+  (small craft with no quantum drive at all — `MPUV Cargo`/`Personnel`/
+  `Tractor`, `Pitbull`, `P-52 Merlin`, both `P-72 Archimedes` variants, all
+  three `Fury` variants) and must be skipped (with a logged warning), not
+  defaulted to `0.0`, which would be indistinguishable from a real
+  zero-range reading — so 237/247 (96%) of real spaceships carry usable
+  data. `cargo_capacity` was never observed `null` for a real spaceship (0
+  of 247) but is frequently a genuine, present `0` (117 of 247 — mostly
+  pure fighters/interceptors with no cargo grid), so a present `0` is kept
+  as-is, never treated as missing — but a genuinely-`null` `cargo_capacity`
+  is skipped (logged warning) exactly like a `null` `quantum_range`, not
+  coerced to `0.0`, which would be indistinguishable from a real
+  zero-cargo fighter. `manufacturer`/`manufacturer.name` was never observed
+  `null` for any of the 237 usable spaceships. **Unit confirmed meters**:
+  cross-checked the Caterpillar's `quantum_range: 70284406669` (→ `70.284`
+  after `/ 1e9`) against its publicly known ~70 million km quantum range
+  spec — matches once treated as meters → gigameters, the same unit the
+  `Distance` table already uses. Sanity range across all 237 usable
+  spaceships: `41.74` Gm (small fighters) to `10204.08` Gm (the `F8A
+  Lightning`, an outlier by design; capital ships like the `Idris-P` sit
+  around `1957` Gm) — all strictly positive, all the same unit, consistent
+  with meters at Star Citizen's in-lore scale.
 
 ## Standing security ground rules
 

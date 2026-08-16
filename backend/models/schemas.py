@@ -48,6 +48,25 @@ class TerminalOut(BaseModel):
     )
 
 
+class ShipOut(BaseModel):
+    """A real player spaceship as exposed to API clients (e.g. the
+    frontend's future ship selector, Phase 2)."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int = Field(..., description="Internal Ship.id surrogate key.")
+    name: str = Field(..., description="Human-readable ship name.")
+    manufacturer_name: str | None = Field(
+        default=None, description="Manufacturer name, if known."
+    )
+    quantum_range_gm: float = Field(
+        ..., description="Quantum drive range in gigameters."
+    )
+    cargo_capacity_scu: float = Field(
+        ..., description="Cargo capacity in SCU (0 for a ship with no cargo grid)."
+    )
+
+
 class RouteRequest(BaseModel):
     """A request to search for a profitable trading route from a starting terminal."""
 
@@ -167,6 +186,7 @@ class RefreshStatusOut(BaseModel):
     terminals_count: int | None = Field(default=None, ge=0)
     prices_count: int | None = Field(default=None, ge=0)
     distances_count: int | None = Field(default=None, ge=0)
+    ships_count: int | None = Field(default=None, ge=0)
     error_message: str | None = Field(
         default=None, description="Error message if `status` is 'failed'."
     )

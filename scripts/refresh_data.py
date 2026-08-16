@@ -59,11 +59,12 @@ def main() -> int:
 
     if result.success:
         logger.info(
-            "manual refresh succeeded: terminals=%d commodities=%d prices=%d distances=%d",
+            "manual refresh succeeded: terminals=%d commodities=%d prices=%d distances=%d ships=%d",
             result.terminals_count,
             result.commodities_count,
             result.prices_count,
             result.distances_count,
+            result.ships_count,
         )
         return 0
 

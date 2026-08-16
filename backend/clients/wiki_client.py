@@ -52,6 +52,77 @@ still assumed possible in production use (hence the 429 handling below,
 which respects `Retry-After` when a server ever does send one), but nothing
 concrete was observed to size a proactive client-side limiter around.
 
+Vehicles listing (Task 11)
+---------------------------
+Verified empirically against the live API (2026-08-15) -- see
+`tests/fixtures/wiki_vehicle*.json` / `wiki_vehicles_list_page1.json` for
+real, unmodified captures and CLAUDE.md's "Data source implementation
+notes" addendum for the full write-up. Summary:
+
+- ``GET /vehicles`` uses the exact same Laravel-style paginated envelope as
+  `/commodities` (`data`/`links.next`/`meta.current_page`/`meta.last_page`),
+  same silent page-size clamp (observed max `200`; a requested `1000` came
+  back as `200`), same absolute-`http://`-URL-in-`links.next` quirk that
+  needs `follow_redirects=True` (already set on this client's shared
+  `httpx.Client` -- see "Confirmed shape" above). 295 total vehicles across
+  2 pages at the clamped size, as of the capture date.
+- **Unlike `/commodities`, list items on `/vehicles` are already the FULL
+  vehicle record** -- not an identity-only stub requiring a separate
+  detail call. Confirmed across all 295 items collected via pagination:
+  every list item carries `quantum`, `cargo_capacity`, `manufacturer`, and
+  everything else a detail call (`GET /vehicles/{slug}`, which does exist
+  and returns the identical shape wrapped the same way) would also return.
+  Consequently there is **no `get_vehicle_detail`-equivalent method** on
+  this client -- `iter_vehicles`/`list_all_vehicles` already return
+  everything ingestion needs in one bulk-listing pass, actually *fewer*
+  requests than the commodities pipeline needs (which requires one detail
+  call per commodity).
+- **`is_spaceship` reliably separates real player spaceships from
+  everything else.** Of 295 total vehicles, 247 have `is_spaceship: true`
+  and 48 have `is_spaceship: false`. Every one of the 48 non-spaceships
+  (ground vehicles like the Ballista/Centurion/Spartan, gravlev vehicles
+  like the Nox, and power-suit "vehicles" like the ATLS) has
+  `quantum.quantum_range: null` -- confirmed to be `null` for all 48, no
+  exceptions -- so there's no risk of a ground vehicle sneaking into the
+  ship table via the range check alone; `is_spaceship` is still checked
+  explicitly first for clarity/defense in depth.
+- **`quantum` is never `null` itself on a spaceship, but
+  `quantum.quantum_range` inside it can be.** Of the 247 real spaceships,
+  10 have `quantum.quantum_range: null` -- small craft with no quantum
+  drive at all (`MPUV Cargo`, `MPUV Personnel`, `MPUV Tractor`, `Pitbull`,
+  `P-52 Merlin`, `P-72 Archimedes` and its `Emerald` variant, `Fury` and
+  its `LX`/`MX` variants). These must be skipped, not crashed on or
+  defaulted to `0.0` (a real `0.0` range would be indistinguishable from
+  "no drive" and would corrupt route search). 237 of 247 spaceships
+  (96%) have real, usable `quantum_range` data.
+- **`cargo_capacity` was never observed `null` for a real spaceship** (0 of
+  247), but is frequently a real, present `0` (117 of 247, mostly pure
+  fighters/interceptors with no cargo grid) -- a genuine, intentional
+  value, not a gap, so a present `0` is kept as `0.0`, never treated as
+  missing. A genuinely-`null` `cargo_capacity`, if one ever appeared, is
+  **skipped** by ingestion (`_reconcile_ships` in `backend/ingest/
+  refresh.py`), with a logged warning, the same way a `null`
+  `quantum_range` is skipped -- not silently coerced to `0.0`, which would
+  make it indistinguishable from a real zero-cargo fighter. The
+  `Ship.cargo_capacity_scu` DB column is still declared `not null` per the
+  task spec since a row is only ever written for a ship that had a real,
+  present value.
+- **`manufacturer` was never observed `null`** for any of the 237 usable
+  spaceships; `manufacturer.name` is what CLAUDE.md/Task 11 call
+  `manufacturer_name`. Still modeled as optional (`WikiVehicleManufacturer
+  | None`) since the field is nullable in the schema and a defensive
+  `None`-check costs nothing.
+- **Unit of `quantum_range` confirmed meters.** Cross-checked the
+  Caterpillar (`quantum_range: 70284406669`, i.e. `70.284406669` after
+  `/ 1e9`) against Star Citizen's publicly known ~70 million km spec sheet
+  figure -- matches once treated as meters -> gigameters, consistent with
+  the existing `Distance` table's gigameter unit. Sanity range across all
+  237 usable spaceships: min `41.74` Gm (small fighters like the `L-22
+  Alpha Wolf`) to max `10204.08` Gm (the `F8A Lightning`, an outlier by
+  design -- capital ships like the `Idris-P` sit around `1957` Gm,
+  `Mauler Destroyer` around `3263` Gm). All strictly positive, all the
+  same unit, consistent with meters at Star Citizen's in-lore scale.
+
 Null vs. zero prices
 ---------------------
 Per CLAUDE.md's edge-weight formula, a *missing* price must never be
@@ -204,6 +275,72 @@ class _WikiCommodityDetailResponse(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     data: WikiCommodityDetail
+
+
+class WikiVehicleManufacturer(BaseModel):
+    """The `manufacturer` object nested in a `WikiVehicleListItem`."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    name: str | None = None
+    code: str | None = None
+
+
+class WikiVehicleQuantum(BaseModel):
+    """The `quantum` object nested in a `WikiVehicleListItem`.
+
+    `quantum_range` is `float | None` on purpose: a real spaceship can
+    genuinely have no quantum drive at all (`quantum_range: null`) -- see
+    module docstring's "Vehicles listing" section. Never defaulted to
+    `0.0`, which would be indistinguishable from a real zero-range reading.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    quantum_range: float | None = None
+
+
+class WikiVehicleListItem(BaseModel):
+    """One entry in the paginated `GET /vehicles` list.
+
+    Despite the name (mirroring `WikiCommodityListItem` for this module's
+    naming convention), this *is* the full vehicle record -- `/vehicles`
+    list items are not identity-only stubs the way `/commodities` list
+    items are. See module docstring's "Vehicles listing" section: there is
+    deliberately no separate `get_vehicle_detail`-equivalent method on this
+    client, because nothing it would return isn't already here.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    uuid: str
+    name: str
+    is_spaceship: bool = False
+    manufacturer: WikiVehicleManufacturer | None = None
+    quantum: WikiVehicleQuantum | None = None
+    cargo_capacity: float | None = None
+
+    @property
+    def manufacturer_name(self) -> str | None:
+        """Convenience accessor for `manufacturer.name`."""
+        return self.manufacturer.name if self.manufacturer is not None else None
+
+    @property
+    def quantum_range_m(self) -> float | None:
+        """Convenience accessor for `quantum.quantum_range` (meters, or
+        `None` if this vehicle has no quantum drive / quantum data at all).
+        """
+        return self.quantum.quantum_range if self.quantum is not None else None
+
+
+class _WikiVehicleListResponse(BaseModel):
+    """Envelope for `GET /vehicles` -- identical shape to `_WikiCommodityListResponse`."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    data: list[WikiVehicleListItem]
+    links: _WikiListLinks
+    meta: _WikiListMeta
 
 
 # --- Errors -------------------------------------------------------------
@@ -416,3 +553,33 @@ class WikiClient:
         raw = self._get_json(f"/commodities/{slug}")
         parsed = _WikiCommodityDetailResponse.model_validate(raw)
         return parsed.data
+
+    def iter_vehicles(self, page_size: int = 200) -> Iterator[WikiVehicleListItem]:
+        """Yield every vehicle list item, transparently following pagination.
+
+        Same pagination convention as `iter_commodities` (`page[size]`,
+        following `links.next` verbatim) -- see module docstring's
+        "Vehicles listing" section for the confirmation. Unlike
+        `iter_commodities`, each yielded item already carries everything
+        (`quantum`, `cargo_capacity`, `manufacturer`, ...) -- no per-item
+        detail call is needed.
+        """
+        url: str | None = "/vehicles"
+        params: dict[str, Any] | None = {"page[size]": page_size}
+        pages = 0
+        while url is not None:
+            raw = self._get_json(url, params=params)
+            parsed = _WikiVehicleListResponse.model_validate(raw)
+            pages += 1
+            for item in parsed.data:
+                yield item
+            url = parsed.links.next
+            params = None  # `next` already carries its own full query string
+
+        logger.info("wiki_client listed vehicles pages=%d", pages)
+
+    def list_all_vehicles(self, page_size: int = 200) -> list[WikiVehicleListItem]:
+        """Eagerly collect every vehicle across all pages into a list."""
+        items = list(self.iter_vehicles(page_size=page_size))
+        logger.info("wiki_client list_all_vehicles count=%d", len(items))
+        return items

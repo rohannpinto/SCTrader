@@ -33,7 +33,7 @@ from fastapi.testclient import TestClient
 import backend.graph.cache as cache_module
 import backend.models.db as db_module
 from backend.graph.cache import get_graph_cache
-from backend.models.db import Commodity, Distance, Price, Terminal, session_scope
+from backend.models.db import Commodity, Distance, Price, Ship, Terminal, session_scope
 from backend.rate_limit import limiter
 from backend.routers.route import _cached_search
 
@@ -125,6 +125,72 @@ def test_terminals_reflects_graph_cache_after_manual_rebuild(client, engine):
         "star_system_name": "Nyx",
         "location_name": "Levski",
     }
+
+
+# --- /ships (Task 11) -------------------------------------------------------------
+
+
+def test_ships_empty_before_any_data(client):
+    response = client.get("/ships")
+    assert response.status_code == 200
+    assert response.json() == []
+
+
+def test_ships_returns_real_seeded_ships(client, engine):
+    with session_scope(engine) as session:
+        session.add(
+            Ship(
+                id=1,
+                wiki_uuid="uuid-caterpillar",
+                name="Caterpillar",
+                manufacturer_name="Drake Interplanetary",
+                quantum_range_gm=70.284406669,
+                cargo_capacity_scu=576.0,
+            )
+        )
+        session.add(
+            Ship(
+                id=2,
+                wiki_uuid="uuid-avenger-stalker",
+                name="Avenger Stalker",
+                manufacturer_name="Aegis Dynamics",
+                quantum_range_gm=112.244897959,
+                cargo_capacity_scu=0.0,
+            )
+        )
+
+    response = client.get("/ships")
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body) == 2
+    # Sorted by name -- "Avenger Stalker" before "Caterpillar".
+    assert [ship["name"] for ship in body] == ["Avenger Stalker", "Caterpillar"]
+    assert body[0] == {
+        "id": 2,
+        "name": "Avenger Stalker",
+        "manufacturer_name": "Aegis Dynamics",
+        "quantum_range_gm": 112.244897959,
+        "cargo_capacity_scu": 0.0,
+    }
+
+
+def test_ships_reflects_null_manufacturer(client, engine):
+    with session_scope(engine) as session:
+        session.add(
+            Ship(
+                id=1,
+                wiki_uuid="uuid-x",
+                name="Mystery Ship",
+                manufacturer_name=None,
+                quantum_range_gm=50.0,
+                cargo_capacity_scu=10.0,
+            )
+        )
+
+    response = client.get("/ships")
+    assert response.status_code == 200
+    body = response.json()
+    assert body[0]["manufacturer_name"] is None
 
 
 # --- /route: validation ----------------------------------------------------------
@@ -342,6 +408,16 @@ def test_refresh_success_updates_status_and_graph_cache(client):
         respx.get(f"{UEX_BASE}/orbits_distances", params={"id_star_system": 68}).mock(
             return_value=httpx.Response(200, json={"status": "ok", "data": [], "message": ""})
         )
+        respx.get(f"{WIKI_BASE}/vehicles").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "data": [],
+                    "links": {"next": None},
+                    "meta": {"current_page": 1, "last_page": 1},
+                },
+            )
+        )
 
         response = client.post("/refresh")
 
@@ -350,6 +426,7 @@ def test_refresh_success_updates_status_and_graph_cache(client):
     assert body["status"] == "success"
     assert body["terminals_count"] == 1
     assert body["commodities_count"] == 0
+    assert body["ships_count"] == 0
     assert body["data_version"] is not None
 
     status_response = client.get("/refresh-status")

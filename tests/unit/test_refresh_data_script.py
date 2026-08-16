@@ -43,6 +43,7 @@ class _FakeRefreshResult:
     commodities_count: Optional[int] = None
     prices_count: Optional[int] = None
     distances_count: Optional[int] = None
+    ships_count: Optional[int] = None
     error_message: Optional[str] = None
 
     @property
@@ -77,7 +78,12 @@ def script_module():
 
 def test_main_returns_zero_and_logs_counts_on_success(script_module, monkeypatch, caplog):
     fake_result = _FakeRefreshResult(
-        status="success", terminals_count=10, commodities_count=5, prices_count=40, distances_count=90
+        status="success",
+        terminals_count=10,
+        commodities_count=5,
+        prices_count=40,
+        distances_count=90,
+        ships_count=8,
     )
     monkeypatch.setattr(script_module, "run_refresh", lambda settings: fake_result)
 
@@ -116,7 +122,12 @@ def test_main_calls_init_db_before_run_refresh(script_module, monkeypatch):
     invoked, mirroring `backend/main.py`'s lifespan ordering."""
     call_order: list[str] = []
     fake_result = _FakeRefreshResult(
-        status="success", terminals_count=1, commodities_count=1, prices_count=1, distances_count=1
+        status="success",
+        terminals_count=1,
+        commodities_count=1,
+        prices_count=1,
+        distances_count=1,
+        ships_count=1,
     )
     monkeypatch.setattr(script_module, "init_db", lambda: call_order.append("init_db"))
     monkeypatch.setattr(
@@ -172,7 +183,12 @@ def test_main_run_twice_against_same_fresh_db_is_idempotent(script_module, monke
     run now non-fresh) must behave identically both times, not error or
     duplicate schema objects on the second call."""
     fake_result = _FakeRefreshResult(
-        status="success", terminals_count=1, commodities_count=1, prices_count=1, distances_count=1
+        status="success",
+        terminals_count=1,
+        commodities_count=1,
+        prices_count=1,
+        distances_count=1,
+        ships_count=1,
     )
     monkeypatch.setattr(script_module, "run_refresh", lambda settings: fake_result)
 

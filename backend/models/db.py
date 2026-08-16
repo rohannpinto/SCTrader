@@ -28,6 +28,11 @@ Schema
                    as the source API reports it (no assumed symmetry).
                    Composite primary key `(terminal_a_id, terminal_b_id)`
                    likewise doubles as the required composite index.
+- `Ship`        -- (Task 11) one row per real player spaceship with usable
+                   quantum-drive data, keyed by the wiki's UUID -- same
+                   stable-internal-id upsert pattern as `Terminal`/
+                   `Commodity`. See `backend/clients/wiki_client.py`'s
+                   vehicles-listing docstring for the empirical filter.
 - `RefreshRun`  -- one row per data-refresh attempt. Its autoincrement `id`
                    doubles as the monotonic "data version" used later for
                    graph-cache invalidation and the `/route` LRU cache key.
@@ -194,6 +199,45 @@ class Distance(Base):
         )
 
 
+class Ship(Base):
+    """A real player spaceship, keyed by its api.star-citizen.wiki UUID.
+
+    Populated by Task 11's ship ingestion phase (`backend/ingest/refresh.py`)
+    from `WikiClient.list_all_vehicles()`, filtered to `is_spaceship=True`
+    vehicles with usable quantum-drive data (`quantum.quantum_range` present
+    and non-null) -- see that client's module docstring for the full
+    empirical filter rationale. Same stable-internal-id upsert pattern as
+    `Terminal`/`Commodity`: looked up by `wiki_uuid` on each refresh so a
+    ship's internal `id` never changes across refreshes.
+    """
+
+    __tablename__ = "ships"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    wiki_uuid: Mapped[str] = mapped_column(String, unique=True, index=True, nullable=False)
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    manufacturer_name: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    quantum_range_gm: Mapped[float] = mapped_column(Float, nullable=False)
+    """Quantum drive range in gigameters -- converted from the wiki API's
+    raw meters (`/ 1e9`) at ingestion time, matching the `Distance` table's
+    existing gigameter unit."""
+    cargo_capacity_scu: Mapped[float] = mapped_column(Float, nullable=False)
+    """Cargo capacity in SCU. `0.0` is a real, common value (a pure fighter
+    with no cargo grid) observed on ~half of real ships empirically -- never
+    treated as missing. A ship is only ingested at all if `cargo_capacity`
+    was actually present (non-null) in the source payload -- ingestion
+    (`_reconcile_ships` in `backend/ingest/refresh.py`) skips, with a
+    logged warning, any spaceship with a null `cargo_capacity`, the same
+    way it already skips one with a null `quantum_range`, rather than
+    coercing the missing value to `0.0` (which would be indistinguishable
+    from a genuine zero-cargo fighter). Never actually observed null for a
+    real spaceship as of this writing, but the filter does not rely on
+    that continuing to hold."""
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid only
+        return f"Ship(id={self.id!r}, name={self.name!r})"
+
+
 #: Allowed values for `RefreshRun.status`. Enforced both here (documentation
 #: / type hint) and at the DB level via a CHECK constraint.
 REFRESH_RUN_STATUSES = ("running", "success", "failed")
@@ -224,6 +268,7 @@ class RefreshRun(Base):
     terminals_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     prices_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     distances_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    ships_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid only
         return f"RefreshRun(id={self.id!r}, status={self.status!r})"
