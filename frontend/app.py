@@ -12,12 +12,23 @@ in a separate terminal:
 overridden via the `BACKEND_BASE_URL` environment variable (e.g. if the
 backend is running on a different port).
 
-Security note: terminal/commodity names rendered here come from the
+Security note: terminal/commodity/ship names rendered here come from the
 external, crowd-sourced wiki/UEX APIs and must be treated as untrusted
 display text, never markup -- `unsafe_allow_html=True` is never used
 anywhere in this module (CLAUDE.md's standing security ground rules).
 Every value from the backend goes through Streamlit's normal (HTML-escaping)
 text/table rendering.
+
+Phase 2 (Task 16): the route form now mirrors the hop-count/cash/cargo
+search model (CLAUDE.md's "Route search problem") -- a ship picked from
+`GET /ships` (its quantum range/cargo capacity drive the search server-
+side), an integer hop budget, and a starting cash balance, replacing
+Phase 1's continuous distance-budget controls entirely. The starting-
+terminal picker is now filtered by System -> Planetoid -> "include orbital
+stations" (derived client-side from the same `GET /terminals` response
+already fetched -- CLAUDE.md's Task 12 addendum documents the underlying
+`planet_name`/`moon_name`/`is_orbital_station` fields) before being handed
+to a searchable `st.selectbox`.
 """
 
 from __future__ import annotations
@@ -31,6 +42,11 @@ BACKEND_BASE_URL = os.environ.get("BACKEND_BASE_URL", "http://localhost:8000")
 REQUEST_TIMEOUT_SECONDS = 15.0
 REFRESH_TIMEOUT_SECONDS = 120.0  # /refresh can take a while: several external API calls
 
+#: Sentinel option meaning "don't filter on this dimension" in the System/
+#: Planetoid dropdowns below. Not a real system/planetoid name, so it can
+#: never collide with live data.
+_ALL_OPTION = "All"
+
 st.set_page_config(page_title="SC Trading Route Optimizer", layout="wide")
 
 
@@ -40,6 +56,13 @@ st.set_page_config(page_title="SC Trading Route Optimizer", layout="wide")
 @st.cache_data(ttl=30)
 def _fetch_terminals() -> list[dict]:
     response = httpx.get(f"{BACKEND_BASE_URL}/terminals", timeout=REQUEST_TIMEOUT_SECONDS)
+    response.raise_for_status()
+    return response.json()
+
+
+@st.cache_data(ttl=30)
+def _fetch_ships() -> list[dict]:
+    response = httpx.get(f"{BACKEND_BASE_URL}/ships", timeout=REQUEST_TIMEOUT_SECONDS)
     response.raise_for_status()
     return response.json()
 
@@ -61,11 +84,14 @@ def _trigger_refresh(token: str | None) -> httpx.Response:
 
 
 def _search_route(
-    start_terminal_id: int, max_distance: float, distance_threshold: float | None
+    start_terminal_id: int, ship_id: int, num_hops: int, starting_budget: float
 ) -> httpx.Response:
-    payload: dict = {"start_terminal_id": start_terminal_id, "max_distance": max_distance}
-    if distance_threshold is not None:
-        payload["distance_threshold"] = distance_threshold
+    payload = {
+        "start_terminal_id": start_terminal_id,
+        "ship_id": ship_id,
+        "num_hops": num_hops,
+        "starting_budget": starting_budget,
+    }
     # Not `raise_for_status()`-ed here: 404/422 carry a `detail` message this
     # UI wants to show the user, not just discard as a generic error.
     return httpx.post(f"{BACKEND_BASE_URL}/route", json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
@@ -120,7 +146,75 @@ def _render_sidebar() -> None:
                         else:
                             st.error(f"Refresh failed: {body.get('error_message') or 'unknown error'}")
                         _fetch_terminals.clear()
+                        _fetch_ships.clear()
                         st.rerun()
+
+
+# --- starting-terminal filtering (System -> Planetoid -> orbital stations) -----
+
+
+def _distinct_systems(terminals: list[dict]) -> list[str]:
+    """Distinct `star_system_name` values present among `terminals`, sorted.
+
+    A terminal with no known system (`star_system_name is None`) is simply
+    omitted from this list -- it's still reachable via "System: All".
+    """
+    return sorted({t["star_system_name"] for t in terminals if t.get("star_system_name")})
+
+
+def _terminal_planetoid(terminal: dict) -> str | None:
+    """A terminal's "planetoid" for filtering purposes -- the specific body
+    it's physically associated with.
+
+    `moon_name` wins over `planet_name` when both are set: CLAUDE.md's Task
+    12 addendum shows a terminal with both fields populated is orbiting/
+    sitting on the moon specifically (e.g. GrimHEX carries
+    `planet_name="Crusader", moon_name="Yela"` -- a player there is at
+    Yela, not broadly "at Crusader"; `ArcCorp Mining Area 045` carries
+    `planet_name="ArcCorp", moon_name="Wala"` and is literally on Wala's
+    surface). Falls back to `planet_name` when only that is set (most
+    orbital stations, e.g. Everus Harbor orbits Hurston directly with no
+    moon involved). Returns `None` when neither is set -- CLAUDE.md's 19
+    deep-space-gateway/Nyx-PSS terminals, which the Planetoid dropdown
+    never lists by name; they're only reachable via "Planetoid: All".
+    """
+    return terminal.get("moon_name") or terminal.get("planet_name")
+
+
+def _terminals_in_system(terminals: list[dict], system: str) -> list[dict]:
+    """`terminals` narrowed to `system`, or all of them when `system` is
+    the "All" sentinel."""
+    if system == _ALL_OPTION:
+        return terminals
+    return [t for t in terminals if t.get("star_system_name") == system]
+
+
+def _distinct_planetoids(terminals: list[dict], system: str) -> list[str]:
+    """Distinct planetoid names (see `_terminal_planetoid`) among terminals
+    in `system` (or all systems, when `system` is "All"), sorted."""
+    scoped = _terminals_in_system(terminals, system)
+    return sorted({planetoid for t in scoped if (planetoid := _terminal_planetoid(t))})
+
+
+def _filter_terminals(
+    terminals: list[dict], system: str, planetoid: str, include_orbital_stations: bool
+) -> list[dict]:
+    """The terminal subset matching the current System/Planetoid/orbital-
+    station filter selections -- what populates the start-terminal picker.
+
+    `include_orbital_stations`, when `False`, drops every
+    `is_orbital_station=True` terminal from the result; when `True`
+    (the default), both ground and orbital terminals matching the other
+    filters are included.
+    """
+    result = []
+    for terminal in _terminals_in_system(terminals, system):
+        if planetoid != _ALL_OPTION and _terminal_planetoid(terminal) != planetoid:
+            continue
+        if not include_orbital_stations and terminal.get("is_orbital_station"):
+            continue
+        result.append(terminal)
+    return result
 
 
 # --- main: route search ----------------------------------------------------------
@@ -128,7 +222,7 @@ def _render_sidebar() -> None:
 
 def _render_route_results(response: httpx.Response) -> None:
     if response.status_code == 404:
-        st.error("Unknown starting terminal.")
+        st.error("Unknown starting terminal or ship.")
         return
     if response.status_code == 422:
         detail = response.json().get("detail", "Invalid request.")
@@ -147,7 +241,9 @@ def _render_route_results(response: httpx.Response) -> None:
         return
 
     st.success(
-        f"Total profit: {body['total_profit']:,.0f} aUEC over {body['total_distance']:,.1f} distance "
+        f"Final cash: {body['final_cash']:,.0f} aUEC  ·  "
+        f"Total profit: {body['total_profit']:,.0f} aUEC  ·  "
+        f"{body['total_distance']:,.1f} distance travelled "
         f"({len(body['hops'])} hop{'s' if len(body['hops']) != 1 else ''})"
     )
     rows = [
@@ -155,6 +251,9 @@ def _render_route_results(response: httpx.Response) -> None:
             "Hop": i + 1,
             "Terminal": hop["terminal_name"],
             "Commodity": hop["commodity_name"] or "—",
+            "Quantity": hop["quantity_traded"],
+            "Unit Buy Price": hop["unit_buy_price"] if hop["unit_buy_price"] is not None else "—",
+            "Unit Sell Price": hop["unit_sell_price"] if hop["unit_sell_price"] is not None else "—",
             "Distance": hop["distance_from_previous"],
             "Profit": hop["profit_this_hop"],
         }
@@ -163,39 +262,71 @@ def _render_route_results(response: httpx.Response) -> None:
     st.table(rows)
 
 
-def _render_route_search(terminals: list[dict]) -> None:
+def _render_route_search(terminals: list[dict], ships: list[dict]) -> None:
     if not terminals:
         st.info("No terminals available yet -- trigger a data refresh from the sidebar first.")
+        return
+    if not ships:
+        st.info("No ships available yet -- trigger a data refresh from the sidebar first.")
+        return
+
+    ship_labels = {
+        ship["id"]: ship["name"]
+        + (f" ({ship['manufacturer_name']})" if ship.get("manufacturer_name") else "")
+        for ship in ships
+    }
+    ship_id = st.selectbox(
+        "Ship",
+        options=list(ship_labels.keys()),
+        format_func=lambda ship_id: ship_labels[ship_id],
+    )
+
+    st.subheader("Starting terminal")
+    filter_col1, filter_col2, filter_col3 = st.columns(3)
+    with filter_col1:
+        system = st.selectbox("System", options=[_ALL_OPTION] + _distinct_systems(terminals))
+    with filter_col2:
+        planetoid = st.selectbox(
+            "Planetoid", options=[_ALL_OPTION] + _distinct_planetoids(terminals, system)
+        )
+    with filter_col3:
+        include_orbital_stations = st.checkbox("Include orbital stations", value=True)
+
+    filtered_terminals = _filter_terminals(terminals, system, planetoid, include_orbital_stations)
+    if not filtered_terminals:
+        st.warning("No terminals match the current System / Planetoid / orbital-station filters.")
         return
 
     terminal_labels = {
         terminal["id"]: terminal["name"]
         + (f" ({terminal['star_system_name']})" if terminal.get("star_system_name") else "")
-        for terminal in terminals
+        for terminal in filtered_terminals
     }
     start_terminal_id = st.selectbox(
         "Starting terminal",
         options=list(terminal_labels.keys()),
         format_func=lambda terminal_id: terminal_labels[terminal_id],
+        # Guarantees case-insensitive substring ("contains") matching while
+        # typing -- Streamlit's default `filter_mode` ("fuzzy") is a looser
+        # in-order-subsequence match that would also happen to satisfy a
+        # middle-of-the-name substring search, but "contains" is the precise
+        # behavior actually wanted here, so it's requested explicitly rather
+        # than relied on implicitly.
+        filter_mode="contains",
     )
 
     col1, col2 = st.columns(2)
     with col1:
-        max_distance = st.number_input(
-            "Max distance budget", min_value=0.01, value=20000.0, step=1000.0
-        )
+        num_hops = st.number_input("Number of hops", min_value=1, value=5, step=1)
     with col2:
-        use_custom_threshold = st.checkbox("Override per-hop distance threshold")
-        distance_threshold = (
-            st.number_input("Distance threshold", min_value=0.01, value=20000.0, step=1000.0)
-            if use_custom_threshold
-            else None
+        starting_budget = st.number_input(
+            "Starting budget (aUEC)", min_value=0.0, value=50_000.0, step=1000.0
         )
 
     if st.button("Find best route", type="primary"):
         with st.spinner("Searching..."):
             try:
-                response = _search_route(start_terminal_id, max_distance, distance_threshold)
+                response = _search_route(start_terminal_id, ship_id, num_hops, starting_budget)
             except httpx.HTTPError:
                 st.error(f"Could not reach the backend at {BACKEND_BASE_URL}.")
                 return
@@ -213,7 +344,13 @@ def main() -> None:
         terminals = []
         st.error(f"Could not reach the backend at {BACKEND_BASE_URL} to list terminals.")
 
-    _render_route_search(terminals)
+    try:
+        ships = _fetch_ships()
+    except httpx.HTTPError:
+        ships = []
+        st.error(f"Could not reach the backend at {BACKEND_BASE_URL} to list ships.")
+
+    _render_route_search(terminals, ships)
 
 
 main()

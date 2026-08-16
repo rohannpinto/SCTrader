@@ -110,6 +110,9 @@ def test_terminals_reflects_graph_cache_after_manual_rebuild(client, engine):
                 star_system_name="Nyx",
                 location_name="Levski",
                 is_commodity_trading=True,
+                planet_name="Hurston",
+                moon_name=None,
+                is_orbital_station=True,
             )
         )
 
@@ -124,6 +127,9 @@ def test_terminals_reflects_graph_cache_after_manual_rebuild(client, engine):
         "name": "Stanton Gateway",
         "star_system_name": "Nyx",
         "location_name": "Levski",
+        "planet_name": "Hurston",
+        "moon_name": None,
+        "is_orbital_station": True,
     }
 
 

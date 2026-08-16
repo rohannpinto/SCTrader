@@ -92,6 +92,9 @@ def test_node_attributes_carry_display_metadata(engine):
                 star_system_name="Nyx",
                 location_name="Levski",
                 is_commodity_trading=True,
+                planet_name=None,
+                moon_name=None,
+                is_orbital_station=False,
             )
         )
 
@@ -102,6 +105,36 @@ def test_node_attributes_carry_display_metadata(engine):
     assert attrs["code"] == "STANTG"
     assert attrs["star_system_name"] == "Nyx"
     assert attrs["location_name"] == "Levski"
+    assert attrs["planet_name"] is None
+    assert attrs["moon_name"] is None
+    assert attrs["is_orbital_station"] is False
+
+
+def test_node_attributes_carry_planetoid_and_orbital_station_metadata(engine):
+    """Task 12/16: `planet_name`/`moon_name`/`is_orbital_station` (used by the
+    frontend's System/Planetoid/"include orbital stations" filters) must ride
+    through onto the graph node exactly like the pre-existing display fields.
+    """
+    with session_scope(engine) as session:
+        session.add(
+            Terminal(
+                id=1,
+                name="Everus Harbor",
+                star_system_name="Stanton",
+                location_name="Everus Harbor",
+                is_commodity_trading=True,
+                planet_name="Hurston",
+                moon_name=None,
+                is_orbital_station=True,
+            )
+        )
+
+    result = build_graph(engine=engine, settings=_settings())
+
+    attrs = result.graph.nodes[1]
+    assert attrs["planet_name"] == "Hurston"
+    assert attrs["moon_name"] is None
+    assert attrs["is_orbital_station"] is True
 
 
 # --- edges carry only `distance` (Phase 2) ------------------------------------

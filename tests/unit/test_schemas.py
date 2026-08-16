@@ -30,6 +30,24 @@ def test_terminal_out_allows_optional_fields_none():
     terminal = TerminalOut(id=1, name="Some Terminal")
     assert terminal.star_system_name is None
     assert terminal.location_name is None
+    assert terminal.planet_name is None
+    assert terminal.moon_name is None
+    assert terminal.is_orbital_station is False
+
+
+def test_terminal_out_carries_planetoid_and_orbital_station_fields():
+    """Task 12/16: `planet_name`/`moon_name`/`is_orbital_station` feed the
+    frontend's System/Planetoid/"include orbital stations" filters."""
+    terminal = TerminalOut(
+        id=1,
+        name="Everus Harbor",
+        planet_name="Hurston",
+        moon_name=None,
+        is_orbital_station=True,
+    )
+    assert terminal.planet_name == "Hurston"
+    assert terminal.moon_name is None
+    assert terminal.is_orbital_station is True
 
 
 def test_terminal_out_from_attributes():
@@ -38,10 +56,15 @@ def test_terminal_out_from_attributes():
         name = "Port Olisar"
         star_system_name = "Stanton"
         location_name = "Crusader"
+        planet_name = "Crusader"
+        moon_name = None
+        is_orbital_station = False
 
     terminal = TerminalOut.model_validate(_FakeOrmTerminal())
     assert terminal.id == 5
     assert terminal.name == "Port Olisar"
+    assert terminal.planet_name == "Crusader"
+    assert terminal.is_orbital_station is False
 
 
 # --- RouteRequest -----------------------------------------------------------

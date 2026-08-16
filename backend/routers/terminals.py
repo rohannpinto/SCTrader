@@ -31,6 +31,9 @@ def list_terminals(request: Request) -> list[TerminalOut]:
             name=attrs["name"],
             star_system_name=attrs.get("star_system_name"),
             location_name=attrs.get("location_name"),
+            planet_name=attrs.get("planet_name"),
+            moon_name=attrs.get("moon_name"),
+            is_orbital_station=attrs.get("is_orbital_station", False),
         )
         for terminal_id, attrs in graph.nodes(data=True)
     ]

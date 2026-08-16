@@ -47,6 +47,22 @@ class TerminalOut(BaseModel):
     location_name: str | None = Field(
         default=None, description="Parent body/station name, if known."
     )
+    planet_name: str | None = Field(
+        default=None,
+        description=(
+            "Planet the terminal (or the moon/station it orbits) belongs to, if known. "
+            "See CLAUDE.md's Task 12 addendum: most orbital stations resolve this "
+            "correctly, but deep-space jump-point gateways and a handful of others "
+            "have neither this nor `moon_name` set."
+        ),
+    )
+    moon_name: str | None = Field(
+        default=None, description="Moon the terminal orbits/sits on, if known."
+    )
+    is_orbital_station: bool = Field(
+        default=False,
+        description="True iff this terminal is an orbital station (not a ground terminal).",
+    )
 
 
 class ShipOut(BaseModel):

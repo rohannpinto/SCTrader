@@ -34,7 +34,11 @@ Node and edge shape
   becomes a node even if it ends up with zero edges -- this is what lets a
   router later tell "unknown terminal" (404) apart from "known but
   isolated terminal" (CLAUDE.md's "isolated start node" case, handled by
-  the search in `backend/graph/search.py`).
+  the search in `backend/graph/search.py`). Node attributes carry display/
+  filtering metadata straight from the `Terminal` row: `name`, `code`,
+  `star_system_name`, `location_name`, and (Task 12) `planet_name`,
+  `moon_name`, `is_orbital_station` -- the last three feed Task 16's
+  frontend System/Planetoid/"include orbital stations" filters.
 - **Edges** are added for *every* `Distance` row between two
   commodity-trading terminals, unconditionally -- this module does **not**
   filter by any distance threshold. A ship's quantum range (Phase 2's
@@ -183,6 +187,9 @@ def build_graph(
                 code=terminal.code,
                 star_system_name=terminal.star_system_name,
                 location_name=terminal.location_name,
+                planet_name=terminal.planet_name,
+                moon_name=terminal.moon_name,
+                is_orbital_station=terminal.is_orbital_station,
             )
 
         buy_prices, sell_prices = _index_prices(session, commodity_terminal_ids)
