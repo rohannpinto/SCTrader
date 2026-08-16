@@ -315,6 +315,53 @@ def test_route_missing_required_field_returns_422(client, field):
     assert response.status_code == 422
 
 
+# --- /route: non-finite float (NaN/Infinity) returns clean 422, not 500 ------------
+#
+# Regression test for a gap found and deliberately deferred during Task 15's
+# review (Task 17 fixes it): a raw JSON body carrying a non-finite float
+# (`NaN`/`Infinity`/`-Infinity`) for a Pydantic-constrained numeric field is
+# correctly rejected by Pydantic, but FastAPI's *default* RequestValidationError
+# handler tries to echo the rejected value back into the 422 response body, and
+# Starlette's `JSONResponse` (`allow_nan=False`) raises `ValueError` serializing
+# it -- caught by the generic exception handler and turned into a `500`. See
+# `backend/main.py`'s `validation_exception_handler` for the fix (a custom
+# `RequestValidationError` handler that never echoes the raw rejected value).
+#
+# Python's own `json.dumps`/most JSON clients refuse to emit non-finite floats
+# by default, so these use `content=` with a hand-written raw body containing
+# the literal `NaN`/`Infinity`/`-Infinity` token, exactly like a client that
+# isn't Python's stdlib `json` module could send.
+
+
+@pytest.mark.parametrize(
+    "raw_body,expected_missing_token",
+    [
+        # starting_budget: float field, `ge=0` -- NaN.
+        (
+            b'{"start_terminal_id": 1, "ship_id": 1, "num_hops": 5, "starting_budget": NaN}',
+            "NaN",
+        ),
+        # starting_budget: float field, `ge=0` -- -Infinity.
+        (
+            b'{"start_terminal_id": 1, "ship_id": 1, "num_hops": 5, "starting_budget": -Infinity}',
+            "Infinity",
+        ),
+        # num_hops: int field, `gt=0` -- Infinity (a different endpoint field,
+        # confirming this isn't specific to `starting_budget` alone).
+        (
+            b'{"start_terminal_id": 1, "ship_id": 1, "num_hops": Infinity, "starting_budget": 1000}',
+            "Infinity",
+        ),
+    ],
+)
+def test_route_non_finite_float_returns_422_not_500(client, raw_body, expected_missing_token):
+    response = client.post(
+        "/route", content=raw_body, headers={"Content-Type": "application/json"}
+    )
+    assert response.status_code == 422
+    assert expected_missing_token not in response.text
+
+
 # --- /route: real outcomes --------------------------------------------------------
 
 

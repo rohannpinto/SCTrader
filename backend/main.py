@@ -17,6 +17,7 @@ import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from slowapi import _rate_limit_exceeded_handler
@@ -72,6 +73,41 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# --- validation error handler: clean 422, never echo the raw rejected value --
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(
+    request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    """Replaces FastAPI's default `RequestValidationError` handler.
+
+    Two problems with the default handler, both fixed here:
+
+    1. **Bug (Task 17):** the default handler echoes the raw rejected value
+       back into the response body (`error["input"]`) and serializes it via
+       Starlette's `JSONResponse`, which calls `json.dumps(..., allow_nan=
+       False)`. A non-finite float (`NaN`/`Infinity`/`-Infinity`) sent for
+       *any* Pydantic-constrained numeric field (e.g. `RouteRequest.
+       starting_budget`'s `ge=0`, `num_hops`'s `gt=0`) is correctly rejected
+       by Pydantic, but that rejected value is exactly the kind of float
+       `json.dumps` refuses to serialize -- raising `ValueError` from
+       *inside* the default validation-error handler itself, which the
+       generic `Exception` handler below then catches and turns into a
+       `500`. Building the response body here with only the error `type`/
+       `loc`/`msg` (never `error["input"]` or `error["ctx"]`, which can
+       likewise hold a non-finite value) avoids ever handing a non-finite
+       float to `JSONResponse`, so this always returns a clean `422`.
+    2. **Hygiene (CLAUDE.md's security ground rules):** even setting the
+       crash aside, echoing back exactly what the client submitted is more
+       detail than a client needs -- dropping `input`/`ctx` is consistent
+       with "never leak more internal detail than necessary."
+    """
+    errors = [
+        {"type": error["type"], "loc": error["loc"], "msg": error["msg"]}
+        for error in exc.errors()
+    ]
+    return JSONResponse(status_code=422, content={"detail": errors})
 
 
 # --- generic error handler: never leak internal exception details ------------
