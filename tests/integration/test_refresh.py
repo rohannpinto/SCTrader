@@ -257,6 +257,67 @@ def test_full_successful_refresh_counts_and_known_values(engine):
         assert price.source_date_updated is not None
 
 
+# --- terminal location refinement (Task 12) ----------------------------------
+
+
+@respx.mock
+def test_terminal_location_refinement_fields_populate_from_uex_data(engine):
+    """Both `_pick_location_name`'s existing `location_name` and the new
+    Task 12 fields (`planet_name`, `moon_name`, `is_orbital_station`) are set
+    directly from the real `uex_terminals_sample.json` fixture (all Nyx
+    terminals). Ground-based terminal: LEVSKI (778, a city on Delamar).
+    Orbital-station terminal: STANTG (802, a deep-space jump-point gateway).
+
+    Per this task's research spike (see CLAUDE.md's Task 12 addendum, and
+    `test_uex_client.py::test_live_orbital_station_planet_association_smoke`
+    for the live-data lock-in): most real orbital stations DO get
+    `planet_name` populated to identify what they orbit (e.g. Everus Harbor
+    -> Hurston) -- but every terminal in this particular fixture is a Nyx
+    terminal, and Nyx has no "planet" body in UEX's data model at all (only
+    orbits like Delamar/gateways), so `planet_name`/`moon_name` are null for
+    every terminal here regardless of ground vs. orbital -- asserted exactly
+    as observed, not assumed.
+    """
+    _mock_successful_refresh()
+
+    result = run_refresh(engine=engine, settings=_settings())
+    assert result.status == "success"
+
+    with session_scope(engine) as session:
+        # Ground-based: a city terminal, not an orbital station.
+        levski = session.query(Terminal).filter_by(uex_terminal_id=LEVSKI_ID).one()
+        assert levski.is_orbital_station is False
+        assert levski.planet_name is None
+        assert levski.moon_name is None
+        assert levski.location_name == "Levski"  # unaffected, `_pick_location_name` unchanged
+
+        # Orbital station: a deep-space jump-point gateway (space_station_name
+        # set), one of the real minority with no parent planetoid on record.
+        stantg = session.query(Terminal).filter_by(uex_terminal_id=STANTG_ID).one()
+        assert stantg.is_orbital_station is True
+        assert stantg.planet_name is None
+        assert stantg.moon_name is None
+        assert stantg.location_name == "Stanton Gateway (Nyx)"  # unaffected
+
+
+@respx.mock
+def test_terminal_location_refinement_defaults_for_stub_terminal(engine):
+    """A wiki-only stub terminal (no `UexTerminal` record at all -- see the
+    existing stub-terminal test) has no source data for the new fields, so
+    they stay at their dataclass/column defaults."""
+    stub_ext_id = 511  # "Admin - Gaslight" -- see existing stub-terminal test
+    _mock_successful_refresh()
+
+    result = run_refresh(engine=engine, settings=_settings())
+    assert result.status == "success"
+
+    with session_scope(engine) as session:
+        stub = session.query(Terminal).filter_by(uex_terminal_id=stub_ext_id).one()
+        assert stub.is_orbital_station is False
+        assert stub.planet_name is None
+        assert stub.moon_name is None
+
+
 # --- same-orbit divide-by-zero floor -----------------------------------------
 
 

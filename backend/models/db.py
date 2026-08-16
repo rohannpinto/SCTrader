@@ -18,7 +18,9 @@ Schema
                    part of the app refers to terminals solely by the
                    internal `id`. `id_orbit` (Task 4) carries UEX's orbit
                    grouping, used by the ingestion pipeline's distance-
-                   expansion algorithm.
+                   expansion algorithm. `planet_name`/`moon_name`/
+                   `is_orbital_station` (Task 12) are additive, finer-grained
+                   location fields alongside the existing `location_name`.
 - `Price`       -- current known buy/sell price for one commodity at one
                    terminal (no history kept). Composite primary key
                    `(terminal_id, commodity_id)` -- this *is* the composite
@@ -150,6 +152,22 @@ class Terminal(Base):
     share an `id_orbit` are the divide-by-zero guard case in CLAUDE.md's
     edge-weight formula; terminals with `id_orbit is None` simply get no
     `Distance` rows until their orbit is known."""
+
+    planet_name: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    moon_name: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    is_orbital_station: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    """(Task 12) Finer-grained location fields alongside the existing
+    `location_name` (which stays a collapsed best-effort display string --
+    additive, not a replacement). Populated directly from `UexTerminal`
+    fields already fetched during ingestion (`backend/ingest/refresh.py`);
+    no new API calls. `is_orbital_station` is `True` iff the source
+    `UexTerminal.space_station_name` was set. Empirically (see CLAUDE.md's
+    Task 12 addendum), most orbital stations' `planet_name`/`moon_name` DO
+    identify the body they orbit (e.g. Baijini Point -> ArcCorp, Everus
+    Harbor -> Hurston) -- but a real minority (deep-space jump-point
+    gateways and a handful of other stations with no orbit-body on record)
+    have neither set. A wiki-only stub terminal (no UEX record at all) also
+    has neither set -- there's no source data to populate them from."""
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid only
         return f"Terminal(id={self.id!r}, name={self.name!r})"

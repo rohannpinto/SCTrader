@@ -279,6 +279,49 @@ shared-context summary.
   Lightning`, an outlier by design; capital ships like the `Idris-P` sit
   around `1957` Gm) — all strictly positive, all the same unit, consistent
   with meters at Star Citizen's in-lore scale.
+- **Task 12 — orbital-station `planet_name`/`moon_name` association,
+  confirmed empirically against live data (2026-08-15):** the open question
+  was whether an orbital station's own `planet_name`/`moon_name` field on
+  `GET /terminals` actually identifies what it orbits, or is simply never
+  populated for stations. **It does, for most stations, but not all.**
+  Queried `GET /terminals?type=commodity` live (161 real commodity
+  terminals): 67 are orbital stations (`space_station_name` set). Of those
+  67:
+  - **48 (72%) have `planet_name` populated**, correctly identifying the
+    orbited planet — e.g. all five ArcCorp Lagrange stations (`ARC-L1`…
+    `ARC-L5`) carry `planet_name: "ArcCorp"`; Baijini Point (orbits
+    ArcCorp) and Everus Harbor (orbits Hurston) both confirmed exactly as
+    the design plan's example expected.
+  - **2 (both GrimHEX's terminals) have `moon_name` populated** (`"Yela"`)
+    — and in that case `planet_name` is *also* populated (`"Crusader"`,
+    `Yela`'s parent planet), not left null. So a station orbiting a moon
+    gets both fields filled in, not just the moon.
+  - **19 (28%) have neither field set** — confirmed to be *exclusively*
+    two categories: (1) deep-space interstellar jump-point gateways (e.g.
+    `TERGAT`/"Terra Gateway (Stanton)", `PYROG`/"Pyro Gateway (Stanton)",
+    and the matching gateway terminals in Pyro and Nyx pointing back at
+    the other two systems), which don't orbit any specific planetoid by
+    game design; and (2) Nyx's four "People's Service Station"
+    terminals (`PSSA`/`PSST`/`PSSL`/`PSSD`), which likewise have no parent
+    planetoid on record in UEX's data (Nyx has no "planet" body in UEX's
+    data model at all — only Delamar and various station/gateway orbits).
+    These 19 terminals are the ones Task 16's frontend must expect to
+    surface only under "Planetoid: All", never a specific planetoid filter
+    — `is_orbital_station=True` with `planet_name`/`moon_name` both `None`.
+  - For reference, ground/non-orbital terminals are nearly always fully
+    populated: 92/94 have `planet_name`, 48/94 additionally have
+    `moon_name` (an outpost on a moon carries both the moon and its parent
+    planet — e.g. `ArcCorp Mining Area 045`: `planet_name: "ArcCorp"`,
+    `moon_name: "Wala"`). The 2 exceptions are terminal 422 ("Admin - UEX
+    Station", the pre-existing `id_orbit: 0` edge case from Task 4) and
+    Levski (a Nyx city terminal on Delamar — again, Nyx has no "planet"
+    body in UEX's model, consistent with the fact that every terminal in
+    `tests/fixtures/uex_terminals_sample.json` — a small all-Nyx excerpt —
+    has `planet_name: null` regardless of ground vs. orbital status).
+  - Locked in for drift detection: `test_uex_client.py::
+    test_live_orbital_station_planet_association_smoke` (checks Everus
+    Harbor, Baijini Point, and Terra Gateway by name against live data,
+    plus the "moon_name set implies planet_name set" invariant).
 
 ## Standing security ground rules
 

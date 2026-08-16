@@ -771,3 +771,38 @@ def test_live_orbits_distances_bulk_ingestion_smoke():
 
     assert len(rows) > 0
     assert all(r.id_star_system_origin == 68 for r in rows)
+
+
+@pytest.mark.live
+def test_live_orbital_station_planet_association_smoke():
+    """Locks in Task 12's research finding for future drift detection: an
+    orbital station's `planet_name` (or `moon_name`) genuinely identifies
+    the body it orbits for most stations, but a real minority (deep-space
+    jump-point gateways) have neither set. Confirmed to need no API key.
+    Not exhaustive -- just two known-stable examples plus the structural
+    invariant (every station with `moon_name` set also has `planet_name`
+    set, since a moon's parent planet is populated too)."""
+    client = UexClient()
+    try:
+        terminals = client.list_terminals(id_star_system=68, type="commodity")  # Stanton
+    finally:
+        client.close()
+
+    by_code = {t.code: t for t in terminals}
+
+    everus_harbor = by_code["EVERU"]
+    assert everus_harbor.space_station_name is not None
+    assert everus_harbor.planet_name == "Hurston"
+
+    baijini_point = by_code["BAIJI"]
+    assert baijini_point.space_station_name is not None
+    assert baijini_point.planet_name == "ArcCorp"
+
+    terra_gateway = by_code["TERGAT"]
+    assert terra_gateway.space_station_name is not None
+    assert terra_gateway.planet_name is None
+    assert terra_gateway.moon_name is None
+
+    for terminal in terminals:
+        if terminal.space_station_name is not None and terminal.moon_name is not None:
+            assert terminal.planet_name is not None

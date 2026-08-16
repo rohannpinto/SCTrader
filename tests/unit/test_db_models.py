@@ -185,6 +185,72 @@ def test_ship_id_stable_surrogate_key_distinct_from_wiki_uuid(engine):
         assert isinstance(ship.id, int)
 
 
+# --- Terminal location refinement (Task 12) --------------------------------
+
+
+def test_terminal_location_refinement_columns_default(engine):
+    # `planet_name`/`moon_name` default to NULL (nullable, no value given);
+    # `is_orbital_station` defaults to False (not-null, has a default).
+    with session_scope(engine) as session:
+        session.add(Terminal(id=1, name="Terminal A"))
+
+    with session_scope(engine) as session:
+        terminal = session.get(Terminal, 1)
+        assert terminal.planet_name is None
+        assert terminal.moon_name is None
+        assert terminal.is_orbital_station is False
+
+
+def test_terminal_location_refinement_columns_store_real_values(engine):
+    with session_scope(engine) as session:
+        session.add(
+            Terminal(
+                id=1,
+                name="Admin - Everus Harbor",
+                planet_name="Hurston",
+                moon_name=None,
+                is_orbital_station=True,
+            )
+        )
+        session.add(
+            Terminal(
+                id=2,
+                name="ArcCorp Mining Area 141",
+                planet_name="Crusader",
+                moon_name="Daymar",
+                is_orbital_station=False,
+            )
+        )
+
+    with session_scope(engine) as session:
+        everus = session.get(Terminal, 1)
+        assert everus.planet_name == "Hurston"
+        assert everus.moon_name is None
+        assert everus.is_orbital_station is True
+
+        mining_area = session.get(Terminal, 2)
+        assert mining_area.planet_name == "Crusader"
+        assert mining_area.moon_name == "Daymar"
+        assert mining_area.is_orbital_station is False
+
+
+def test_terminal_location_refinement_column_schema(engine):
+    # Verify nullability directly against the actual DB schema (reflection),
+    # rather than through the ORM -- a scalar Python-side `default=False`
+    # applies to `is_orbital_station` even when `None` is explicitly passed
+    # at construction time, so an ORM-level "insert None, expect
+    # IntegrityError" test would never actually exercise the NOT NULL
+    # constraint. Reflection checks the schema itself instead.
+    from sqlalchemy import inspect
+
+    inspector = inspect(engine)
+    columns = {col["name"]: col for col in inspector.get_columns("terminals")}
+
+    assert columns["planet_name"]["nullable"] is True
+    assert columns["moon_name"]["nullable"] is True
+    assert columns["is_orbital_station"]["nullable"] is False
+
+
 # --- Price composite PK ---------------------------------------------------
 
 

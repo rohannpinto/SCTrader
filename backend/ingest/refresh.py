@@ -71,6 +71,20 @@ UEX's `id_orbit: 0` sentinel ("no parent orbit on record", e.g. terminal 422
 orbit rather than being treated as a real orbit shared by every other
 `id_orbit: 0` terminal.
 
+Terminal location refinement (Task 12)
+----------------------------------------
+`Terminal.planet_name` / `.moon_name` / `.is_orbital_station` are additive
+fields set alongside the existing `location_name` (`_pick_location_name`,
+unchanged) in the same main UEX-terminal loop inside `_reconcile`, sourced
+directly from `UexTerminal` fields already being fetched -- no new API
+calls. `is_orbital_station = (space_station_name is not None)`. See
+CLAUDE.md's Task 12 addendum for the empirical research on what fraction of
+orbital stations actually have `planet_name`/`moon_name` populated (most
+do; deep-space jump-point gateways and a handful of others do not). The
+wiki-only stub-terminal path (no `UexTerminal` available) leaves these three
+fields at their dataclass defaults (`None`/`None`/`False`) since there's no
+source data to populate them from.
+
 Ship ingestion (Task 11)
 --------------------------
 A genuinely separate phase from the terminal/commodity/price/distance
@@ -203,7 +217,14 @@ def _fetch_all(wiki: WikiClient, uex: UexClient) -> _FetchedData:
 
 @dataclass
 class _TerminalData:
-    """Desired state for one `Terminal` row, keyed by external id upstream."""
+    """Desired state for one `Terminal` row, keyed by external id upstream.
+
+    `planet_name`/`moon_name`/`is_orbital_station` (Task 12) default to
+    `None`/`None`/`False` so the wiki-only stub-terminal creation path below
+    (which has no `UexTerminal` to source them from) doesn't need to be
+    touched -- only the main UEX-terminal loop, which calls
+    `_pick_location_name`, sets them explicitly.
+    """
 
     name: str
     code: Optional[str]
@@ -212,6 +233,9 @@ class _TerminalData:
     raw_type: Optional[str]
     star_system_name: Optional[str]
     location_name: Optional[str]
+    planet_name: Optional[str] = None
+    moon_name: Optional[str] = None
+    is_orbital_station: bool = False
 
 
 @dataclass
@@ -380,6 +404,9 @@ def _reconcile(fetched: _FetchedData, settings: Settings) -> _ReconciledData:
             raw_type=uex_terminal.type,
             star_system_name=uex_terminal.star_system_name,
             location_name=_pick_location_name(uex_terminal),
+            planet_name=uex_terminal.planet_name,
+            moon_name=uex_terminal.moon_name,
+            is_orbital_station=uex_terminal.space_station_name is not None,
         )
 
     # --- commodities + prices, from wiki commodity details ------------------
@@ -504,6 +531,9 @@ def _upsert_terminals_and_commodities(
         row.raw_type = data.raw_type
         row.star_system_name = data.star_system_name
         row.location_name = data.location_name
+        row.planet_name = data.planet_name
+        row.moon_name = data.moon_name
+        row.is_orbital_station = data.is_orbital_station
         terminal_rows_by_ext_id[ext_id] = row
 
     existing_commodity_rows: dict[str, Commodity] = {
