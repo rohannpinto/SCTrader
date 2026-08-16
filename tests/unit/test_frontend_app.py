@@ -15,6 +15,7 @@ mocks both endpoints even when a test cares only about one of them.
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import httpx
@@ -392,70 +393,280 @@ def test_starting_terminal_selectbox_uses_contains_filter_mode():
     assert terminal_box.proto.filter_mode == SelectWidgetFilterMode_pb2.FILTER_MODE_CONTAINS
 
 
-# --- route search results (Task 16: quantity/unit-price columns) -----------------
+# --- route search results (rework: one row per terminal STOP, not per hop) -------
+#
+# The project owner's reported confusion: `RouteHop.unit_buy_price` is the
+# per-unit buy price at the hop's *origin*, `unit_sell_price` at its
+# *destination* -- a hop-per-row table hid which terminal a buy/sell
+# actually happens at, and never showed a "buy this" instruction for the
+# starting terminal at all. `frontend.app._stop_rows` (exercised here only
+# indirectly, via the rendered `st.dataframe`, matching this file's existing
+# AppTest-only convention -- `frontend/app.py` calls `main()` unconditionally
+# at import time, so it can't be imported directly in a normal test) now
+# builds one row per terminal *stop*: for `n` hops there are `n + 1` stops --
+# stop 0 is the start (buy only), stops `1..n-1` are intermediate (sell what
+# was carried in, buy what will be carried out), stop `n` is the end (sell
+# only).
+#
+# `_render_route_results` switched from `st.table` to `st.dataframe` (wider,
+# far more numeric columns now) -- results are read via `at.dataframe`, not
+# `at.table`.
 
 
-@respx.mock
-def test_app_shows_found_route_results_with_per_hop_trade_details():
+def _route_response_json(
+    *,
+    hops: list[dict],
+    starting_budget: float,
+    final_cash: float,
+    total_profit: float,
+    total_distance: float,
+) -> dict:
+    return {
+        "found": True,
+        "start_terminal_id": 1,
+        "hops": hops,
+        "total_distance": total_distance,
+        "starting_budget": starting_budget,
+        "final_cash": final_cash,
+        "total_profit": total_profit,
+        "message": None,
+    }
+
+
+def _run_route_search(route_response_json: dict):
+    """Mocks status/terminals/ships/route, runs the app, clicks "Find best
+    route" with the default (first-listed) starting terminal and ship
+    selections, and returns the resulting `AppTest`."""
     _mock_status_terminals_ships(terminals=_terminals_payload(), ships=_ships_payload())
     respx.post(f"{BACKEND_BASE_URL}/route").mock(
-        return_value=httpx.Response(
-            200,
-            json={
-                "found": True,
-                "start_terminal_id": 1,
-                "hops": [
-                    {
-                        "terminal_id": 2,
-                        "terminal_name": "Everus Harbor",
-                        "commodity_id": 1,
-                        "commodity_name": "Laranite",
-                        "distance_from_previous": 10.0,
-                        "quantity_traded": 50.0,
-                        "unit_buy_price": 3.5,
-                        "unit_sell_price": 5.0,
-                        "profit_this_hop": 75.0,
-                    },
-                    {
-                        "terminal_id": 3,
-                        "terminal_name": "ArcCorp Mining Area 045",
-                        "commodity_id": None,
-                        "commodity_name": None,
-                        "distance_from_previous": 4.0,
-                        "quantity_traded": 0.0,
-                        "unit_buy_price": None,
-                        "unit_sell_price": None,
-                        "profit_this_hop": 0.0,
-                    },
-                ],
-                "total_distance": 14.0,
-                "starting_budget": 500.0,
-                "final_cash": 575.0,
-                "total_profit": 75.0,
-                "message": None,
-            },
-        )
+        return_value=httpx.Response(200, json=route_response_json)
     )
 
     at = AppTest.from_file(APP_PATH)
     at.run()
     _find_button(at, "Find best route").click().run(timeout=15)
-
     assert not at.exception
+    return at
+
+
+@respx.mock
+def test_app_shows_per_stop_buy_sell_rows_for_worked_example():
+    """The exact worked example from the task write-up: a 2-hop route
+    (buy Gold at the start, sell it and buy Silver at the middle stop, sell
+    Silver at the end), asserting the precise per-stop buy/sell/cash values.
+    """
+    hops = [
+        {
+            "terminal_id": 2,
+            "terminal_name": "Everus Harbor",
+            "commodity_id": 10,
+            "commodity_name": "Gold",
+            "distance_from_previous": 5.0,
+            "quantity_traded": 50.0,
+            "unit_buy_price": 20.0,
+            "unit_sell_price": 30.0,
+            "profit_this_hop": 500.0,
+        },
+        {
+            "terminal_id": 3,
+            "terminal_name": "ArcCorp Mining Area 045",
+            "commodity_id": 20,
+            "commodity_name": "Silver",
+            "distance_from_previous": 3.0,
+            "quantity_traded": 80.0,
+            "unit_buy_price": 10.0,
+            "unit_sell_price": 15.0,
+            "profit_this_hop": 400.0,
+        },
+    ]
+    at = _run_route_search(
+        _route_response_json(
+            hops=hops, starting_budget=1000.0, final_cash=1900.0, total_profit=900.0, total_distance=8.0
+        )
+    )
+
+    assert any("Final cash: 1,900" in success.value for success in at.success)
+    assert any("Total profit: 900" in success.value for success in at.success)
+
+    dataframes = at.dataframe
+    assert len(dataframes) == 1
+    df = dataframes[0].value
+    assert len(df) == 3  # start + 2 hop destinations
+
+    # Stop 0 ("Alpha" in the write-up -- the default-selected starting
+    # terminal here, "Lorville - Trade and Development Division"): buy 50
+    # Gold @ 20.0 (cost 1000.0), nothing to sell yet.
+    row0 = df.iloc[0]
+    assert row0["Stop"] == 0
+    assert row0["Terminal"] == "Lorville - Trade and Development Division"
+    assert row0["Sell Commodity"] == "—"
+    assert math.isnan(row0["Sell Qty"])
+    assert row0["Buy Commodity"] == "Gold"
+    assert row0["Buy Qty"] == 50.0
+    assert row0["Buy Unit Price"] == 20.0
+    assert row0["Buy Cost"] == 1000.0
+    assert row0["Cash After"] == 0.0  # 1000.0 - 1000.0
+
+    # Stop 1 ("Bravo"/Everus Harbor): sell 50 Gold @ 30.0 (proceeds 1500.0,
+    # profit +500.0), buy 80 Silver @ 10.0 (cost 800.0).
+    row1 = df.iloc[1]
+    assert row1["Stop"] == 1
+    assert row1["Terminal"] == "Everus Harbor"
+    assert row1["Distance In"] == 5.0
+    assert row1["Sell Commodity"] == "Gold"
+    assert row1["Sell Qty"] == 50.0
+    assert row1["Sell Unit Price"] == 30.0
+    assert row1["Sell Proceeds"] == 1500.0
+    assert row1["Sell Profit"] == 500.0
+    assert row1["Buy Commodity"] == "Silver"
+    assert row1["Buy Qty"] == 80.0
+    assert row1["Buy Unit Price"] == 10.0
+    assert row1["Buy Cost"] == 800.0
+    assert row1["Cash After"] == 700.0  # 0.0 + 1500.0 - 800.0
+
+    # Stop 2 ("Charlie"/ArcCorp Mining Area 045, the final stop): sell 80
+    # Silver @ 15.0 (proceeds 1200.0, profit +400.0), nothing more to buy.
+    row2 = df.iloc[2]
+    assert row2["Stop"] == 2
+    assert row2["Terminal"] == "ArcCorp Mining Area 045"
+    assert row2["Distance In"] == 3.0
+    assert row2["Sell Commodity"] == "Silver"
+    assert row2["Sell Qty"] == 80.0
+    assert row2["Sell Unit Price"] == 15.0
+    assert row2["Sell Proceeds"] == 1200.0
+    assert row2["Sell Profit"] == 400.0
+    assert row2["Buy Commodity"] == "—"
+    assert math.isnan(row2["Buy Qty"])
+    assert row2["Cash After"] == 1900.0  # 700.0 + 1200.0
+
+    # The running-cash invariant this task specifically calls out: the last
+    # stop's derived running cash must equal `RouteResponse.final_cash`
+    # exactly (checked programmatically here, against real rendered
+    # response data -- not eyeballed).
+    assert math.isclose(row2["Cash After"], 1900.0, rel_tol=1e-9, abs_tol=1e-9)
+
+
+@respx.mock
+def test_app_labels_bridge_hop_clearly_not_blank():
+    """A bridge hop (`commodity_id is None`) must read as an explicit
+    "repositioning" label, never a blank/confusing cell -- here the second
+    (and last) hop is a bridge hop, so the final stop's sell side is
+    affected."""
+    hops = [
+        {
+            "terminal_id": 2,
+            "terminal_name": "Everus Harbor",
+            "commodity_id": 1,
+            "commodity_name": "Laranite",
+            "distance_from_previous": 10.0,
+            "quantity_traded": 50.0,
+            "unit_buy_price": 3.5,
+            "unit_sell_price": 5.0,
+            "profit_this_hop": 75.0,
+        },
+        {
+            "terminal_id": 3,
+            "terminal_name": "ArcCorp Mining Area 045",
+            "commodity_id": None,
+            "commodity_name": None,
+            "distance_from_previous": 4.0,
+            "quantity_traded": 0.0,
+            "unit_buy_price": None,
+            "unit_sell_price": None,
+            "profit_this_hop": 0.0,
+        },
+    ]
+    at = _run_route_search(
+        _route_response_json(
+            hops=hops, starting_budget=500.0, final_cash=575.0, total_profit=75.0, total_distance=14.0
+        )
+    )
+
     assert any("Final cash: 575" in success.value for success in at.success)
     assert any("Total profit: 75" in success.value for success in at.success)
 
-    tables = at.table
-    assert len(tables) == 1
-    df = tables[0].value
-    assert list(df["Quantity"]) == [50.0, 0.0]
-    # `st.table` stringifies an entire column once it mixes floats with the
-    # "—" bridge-hop placeholder (Streamlit's Arrow-serialization fallback
-    # for a non-uniform column) -- values are still exactly right, just
-    # rendered as text rather than numerics for this mixed column.
-    assert list(df["Unit Buy Price"]) == ["3.5", "—"]
-    assert list(df["Unit Sell Price"]) == ["5.0", "—"]
-    assert list(df["Commodity"]) == ["Laranite", "—"]
+    df = at.dataframe[0].value
+    assert len(df) == 3
+
+    # Stop 0: buy Laranite as normal.
+    row0 = df.iloc[0]
+    assert row0["Buy Commodity"] == "Laranite"
+    assert row0["Buy Cost"] == 175.0  # 50 * 3.5
+
+    # Stop 1 (Everus Harbor): sells the Laranite bought at stop 0 as normal,
+    # but the *outgoing* hop (to stop 2) is the bridge hop -- buy side must
+    # be clearly labeled, not blank.
+    row1 = df.iloc[1]
+    assert row1["Sell Commodity"] == "Laranite"
+    assert row1["Sell Proceeds"] == 250.0  # 50 * 5.0
+    assert row1["Buy Commodity"] == "No purchase — repositioning"
+    assert math.isnan(row1["Buy Qty"])
+    assert math.isnan(row1["Buy Unit Price"])
+    assert math.isnan(row1["Buy Cost"])
+
+    # Stop 2 (ArcCorp Mining Area 045, final stop): the *incoming* hop was
+    # the bridge hop -- sell side must be clearly labeled, not blank, and
+    # distinct from "no buy" (there's genuinely nothing more to buy here
+    # since the route ends, which is a different, unlabeled "—" case).
+    row2 = df.iloc[2]
+    assert row2["Sell Commodity"] == "No sale — repositioning"
+    assert math.isnan(row2["Sell Qty"])
+    assert math.isnan(row2["Sell Proceeds"])
+    assert row2["Buy Commodity"] == "—"
+
+    assert math.isclose(row2["Cash After"], 575.0, rel_tol=1e-9, abs_tol=1e-9)
+
+
+@respx.mock
+def test_app_shows_single_hop_route_buy_only_then_sell_only():
+    """The smallest case, easy to get an off-by-one wrong on: a single-hop
+    route has exactly 2 stops -- stop 0 is buy-only (no intermediate stop
+    with both a sell and a buy action exists at all), stop 1 is sell-only.
+    """
+    hops = [
+        {
+            "terminal_id": 2,
+            "terminal_name": "Everus Harbor",
+            "commodity_id": 1,
+            "commodity_name": "Laranite",
+            "distance_from_previous": 10.0,
+            "quantity_traded": 20.0,
+            "unit_buy_price": 3.5,
+            "unit_sell_price": 5.0,
+            "profit_this_hop": 30.0,
+        },
+    ]
+    at = _run_route_search(
+        _route_response_json(
+            hops=hops, starting_budget=100.0, final_cash=130.0, total_profit=30.0, total_distance=10.0
+        )
+    )
+
+    df = at.dataframe[0].value
+    assert len(df) == 2
+
+    row0 = df.iloc[0]
+    assert row0["Stop"] == 0
+    assert row0["Terminal"] == "Lorville - Trade and Development Division"
+    assert row0["Sell Commodity"] == "—"
+    assert row0["Buy Commodity"] == "Laranite"
+    assert row0["Buy Qty"] == 20.0
+    assert row0["Buy Cost"] == 70.0  # 20 * 3.5
+    assert row0["Cash After"] == 30.0  # 100.0 - 70.0
+
+    row1 = df.iloc[1]
+    assert row1["Stop"] == 1
+    assert row1["Terminal"] == "Everus Harbor"
+    assert row1["Sell Commodity"] == "Laranite"
+    assert row1["Sell Qty"] == 20.0
+    assert row1["Sell Proceeds"] == 100.0  # 20 * 5.0
+    assert row1["Sell Profit"] == 30.0
+    assert row1["Buy Commodity"] == "—"
+    assert math.isnan(row1["Buy Qty"])
+
+    # Running-cash invariant, once more on the smallest possible route.
+    assert row1["Cash After"] == 130.0
+    assert math.isclose(row1["Cash After"], 130.0, rel_tol=1e-9, abs_tol=1e-9)
 
 
 @respx.mock

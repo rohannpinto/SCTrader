@@ -33,6 +33,7 @@ to a searchable `st.selectbox`.
 
 from __future__ import annotations
 
+import math
 import os
 
 import httpx
@@ -220,7 +221,107 @@ def _filter_terminals(
 # --- main: route search ----------------------------------------------------------
 
 
-def _render_route_results(response: httpx.Response) -> None:
+def _stop_rows(body: dict, start_terminal_name: str) -> list[dict]:
+    """One row per terminal *stop* along the route (the start, plus each
+    hop's destination) rather than one row per hop.
+
+    `RouteHop.unit_buy_price` is documented as the per-unit buy price at
+    the hop's *origin*, `unit_sell_price` at its *destination*
+    (`backend/models/schemas.py`) -- so a hop-per-row table hid which
+    terminal a buy/sell actually happens at, and never showed a "buy this"
+    instruction for the starting terminal at all. For `n = len(hops)` hops
+    there are `n + 1` stops: stop `0` is the starting terminal (buy only --
+    nothing carried in yet to sell), stops `1..n-1` are intermediate (sell
+    whatever was carried in from the previous hop, then buy whatever will
+    be carried out to the next one), and stop `n` is the final terminal
+    (sell only -- the route ends there, nothing more to buy).
+
+    A hop with `commodity_id is None` is a neutral "bridge" hop (CLAUDE.md's
+    Phase 2 search model) -- travelled, but nothing bought/sold on it. That
+    renders as an explicit "repositioning" label on whichever side (buy
+    and/or sell) it affects, never a blank cell. It's kept distinct from a
+    stop that simply has no buy side (the final stop) or no sell side (the
+    starting stop) -- those use a plain "—" placeholder instead, since
+    there's no hop at all on that side to explain.
+    """
+    hops = body["hops"]
+    n = len(hops)
+    rows: list[dict] = []
+    cash = body["starting_budget"]
+
+    for i in range(n + 1):
+        sell_hop = hops[i - 1] if i >= 1 else None
+        buy_hop = hops[i] if i <= n - 1 else None
+
+        if sell_hop is None:
+            sell_commodity = "—"
+            sell_qty = sell_unit_price = sell_proceeds = sell_profit = None
+            distance_in = None
+        else:
+            distance_in = sell_hop["distance_from_previous"]
+            if sell_hop["commodity_id"] is None:
+                sell_commodity = "No sale — repositioning"
+                sell_qty = sell_unit_price = sell_proceeds = sell_profit = None
+            else:
+                sell_commodity = sell_hop["commodity_name"]
+                sell_qty = sell_hop["quantity_traded"]
+                sell_unit_price = sell_hop["unit_sell_price"]
+                sell_proceeds = sell_qty * sell_unit_price
+                sell_profit = sell_hop["profit_this_hop"]
+
+        if buy_hop is None:
+            buy_commodity = "—"
+            buy_qty = buy_unit_price = buy_cost = None
+        elif buy_hop["commodity_id"] is None:
+            buy_commodity = "No purchase — repositioning"
+            buy_qty = buy_unit_price = buy_cost = None
+        else:
+            buy_commodity = buy_hop["commodity_name"]
+            buy_qty = buy_hop["quantity_traded"]
+            buy_unit_price = buy_hop["unit_buy_price"]
+            buy_cost = buy_qty * buy_unit_price
+
+        cash += sell_proceeds or 0.0
+        cash -= buy_cost or 0.0
+
+        rows.append(
+            {
+                "Stop": i,
+                "Terminal": start_terminal_name if i == 0 else sell_hop["terminal_name"],
+                "Distance In": distance_in,
+                "Sell Commodity": sell_commodity,
+                "Sell Qty": sell_qty,
+                "Sell Unit Price": sell_unit_price,
+                "Sell Proceeds": sell_proceeds,
+                "Sell Profit": sell_profit,
+                "Buy Commodity": buy_commodity,
+                "Buy Qty": buy_qty,
+                "Buy Unit Price": buy_unit_price,
+                "Buy Cost": buy_cost,
+                "Cash After": cash,
+            }
+        )
+
+    # Correctness check, not a cosmetic nicety: the running cash derived
+    # stop-by-stop above must land exactly on `final_cash` (within float
+    # tolerance). Every `Cash After` value telescopes solely from
+    # `sell_proceeds`/`buy_cost` against `starting_budget`, so this either
+    # holds by construction or the derivation above has a real bug -- fail
+    # loudly rather than silently render a wrong number, matching this
+    # codebase's existing style of hard-checking cross-field invariants
+    # (see `RouteResponse`'s own `model_validator`s in
+    # `backend/models/schemas.py`).
+    final_cash = body["final_cash"]
+    if not math.isclose(rows[-1]["Cash After"], final_cash, rel_tol=1e-6, abs_tol=1e-6):
+        raise ValueError(
+            "Route results table: derived running cash "
+            f"({rows[-1]['Cash After']!r}) does not reconcile with "
+            f"RouteResponse.final_cash ({final_cash!r})."
+        )
+    return rows
+
+
+def _render_route_results(response: httpx.Response, start_terminal_name: str) -> None:
     if response.status_code == 404:
         st.error("Unknown starting terminal or ship.")
         return
@@ -246,20 +347,39 @@ def _render_route_results(response: httpx.Response) -> None:
         f"{body['total_distance']:,.1f} distance travelled "
         f"({len(body['hops'])} hop{'s' if len(body['hops']) != 1 else ''})"
     )
-    rows = [
-        {
-            "Hop": i + 1,
-            "Terminal": hop["terminal_name"],
-            "Commodity": hop["commodity_name"] or "—",
-            "Quantity": hop["quantity_traded"],
-            "Unit Buy Price": hop["unit_buy_price"] if hop["unit_buy_price"] is not None else "—",
-            "Unit Sell Price": hop["unit_sell_price"] if hop["unit_sell_price"] is not None else "—",
-            "Distance": hop["distance_from_previous"],
-            "Profit": hop["profit_this_hop"],
-        }
-        for i, hop in enumerate(body["hops"])
-    ]
-    st.table(rows)
+
+    rows = _stop_rows(body, start_terminal_name)
+
+    # `st.dataframe`, not `st.table`: one row per stop now spans separate
+    # buy/sell/cash columns (wider and far more numeric than the old
+    # one-row-per-hop table), so it benefits from `st.dataframe`'s
+    # scrollable container and per-column numeric formatting via
+    # `column_config`. It also sidesteps a known `st.table` quirk (a column
+    # mixing floats with a "—" string placeholder gets silently stringified
+    # whole) -- the "—"/"repositioning" placeholders here live only in the
+    # text `*Commodity` columns; every numeric column stays `float | None`
+    # (rendered as blank by `st.dataframe`, not a placeholder string), so
+    # no numeric column ever mixes types.
+    st.dataframe(
+        rows,
+        hide_index=True,
+        column_config={
+            "Stop": st.column_config.NumberColumn(format="%d"),
+            "Distance In": st.column_config.NumberColumn(
+                format="%.1f", help="Distance travelled from the previous stop to reach this one."
+            ),
+            "Sell Qty": st.column_config.NumberColumn(format="%.1f"),
+            "Sell Unit Price": st.column_config.NumberColumn(format="%.2f"),
+            "Sell Proceeds": st.column_config.NumberColumn(format="%.2f"),
+            "Sell Profit": st.column_config.NumberColumn(format="%.2f"),
+            "Buy Qty": st.column_config.NumberColumn(format="%.1f"),
+            "Buy Unit Price": st.column_config.NumberColumn(format="%.2f"),
+            "Buy Cost": st.column_config.NumberColumn(format="%.2f"),
+            "Cash After": st.column_config.NumberColumn(
+                format="%.2f", help="Running cash on hand after this stop's sell/buy."
+            ),
+        },
+    )
 
 
 def _render_route_search(terminals: list[dict], ships: list[dict]) -> None:
@@ -302,6 +422,11 @@ def _render_route_search(terminals: list[dict], ships: list[dict]) -> None:
         + (f" ({terminal['star_system_name']})" if terminal.get("star_system_name") else "")
         for terminal in filtered_terminals
     }
+    # Raw (unsuffixed) display names, keyed by id -- threaded through to the
+    # results table so it can show "buy this at <starting terminal name>"
+    # without the backend needing to echo the name back itself; the user
+    # just picked it from this very selectbox.
+    terminal_names = {terminal["id"]: terminal["name"] for terminal in filtered_terminals}
     start_terminal_id = st.selectbox(
         "Starting terminal",
         options=list(terminal_labels.keys()),
@@ -330,7 +455,7 @@ def _render_route_search(terminals: list[dict], ships: list[dict]) -> None:
             except httpx.HTTPError:
                 st.error(f"Could not reach the backend at {BACKEND_BASE_URL}.")
                 return
-        _render_route_results(response)
+        _render_route_results(response, terminal_names[start_terminal_id])
 
 
 def main() -> None:
