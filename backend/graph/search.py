@@ -115,9 +115,90 @@ the `/route` router's responsibility, not this module's -- `find_best_route`
 is a pure algorithm over whatever graph/parameters it's given. It still
 never crashes on invalid input (out-of-graph start node, non-positive
 `num_hops`/`ship_jump_range_gm`, negative `starting_budget`/
-`ship_cargo_capacity_scu`) -- it returns a clean `found=False` instead,
-purely as defense in depth for direct/test callers, not as a substitute for
-the router's validation.
+`ship_cargo_capacity_scu`, non-positive `rank`) -- it returns a clean
+`found=False` instead, purely as defense in depth for direct/test callers,
+not as a substitute for the router's validation.
+
+Phase 3: top-K route ranking (`rank`)
+-----------------------------------------
+Phase 3 adds a `rank: int = 1` parameter for risk/reward route ranking (see
+the approved plan's "Phase 3" section): instead of only ever returning the
+single best-cash route, a caller can ask for the `rank`-th best *distinct*
+route by final cash. `rank=1` is, and must stay, byte-for-byte identical in
+both behavior and performance to the original Phase 2 algorithm above --
+`find_best_route` dispatches to `_find_single_best_route` (the untouched
+original single-best-label-per-`(node, hop)` DP, zero added bookkeeping) for
+`rank <= 1`, and to `_find_top_k_routes` (the generalized top-K DP below)
+only when `rank > 1`.
+
+**Why "keep the top-`rank` labels per `(node, hop)`, discard the rest" finds
+the true global `rank`-th-best distinct route -- not a heuristic, a direct
+generalization of this module's existing monotonicity proof, one level up:**
+fix a `(node, hops_used)` state. As already proved above, more cash at that
+state always weakly dominates less cash under *any* identical future
+extension (same edges applied to a higher-cash label can never end up with
+less cash than applying them to a lower-cash label, because `quantity` is
+monotonically non-decreasing in `cash`, capped by the same fixed
+`ship_cargo_capacity_scu` either way). Consequence: if a label `B` is not
+among the top-`rank` labels retained at `(node, hops_used)`, there are
+already `rank` *other*, distinct-by-construction labels at that exact same
+`(node, hops_used)` with cash >= `B`'s. That's true in both of `B`'s
+possible roles:
+
+- **As a candidate final answer in its own right** (every label, at
+  whatever hop it was created, is itself a complete, valid route of that
+  many hops) -- `B` is directly beaten by `rank` other same-length routes
+  ending at the same node, so it cannot be the global `rank`-th best.
+- **As a prefix `B` might extend further**: for *any* future sequence of
+  edges `B` might have taken from here, each of the `rank` retained labels
+  ranked above `B`, extended via that identical sequence, ends up with
+  cash >= what `B`'s extension would have produced (same monotonicity
+  argument, applied to the suffix). So whatever final route `B` might have
+  produced is dominated by `rank` other *actually reachable* routes built
+  from a retained label plus that same suffix.
+
+Applying this inductively hop-by-hop (a retained label surviving fewer than
+`rank`-deep at some *later* state is, by the same argument, itself dominated
+by `rank` other retained labels at that later state, and so on) means no
+discarded label -- at any point along its walk -- can ever be needed to
+compute the true global top-`rank` distinct routes. Each retained label
+still carries its own unique parent-pointer chain (see "Path reconstruction"
+above -- unchanged, no list/tuple path concatenation reintroduced), so
+`rank` labels at a state are `rank` genuinely distinct routes by
+construction, not just `rank` different cash numbers that might collide on
+the same underlying path.
+
+**Mechanics** (`_find_top_k_routes`): `hop_labels[h]` becomes
+`{node: [best_label, ..., rank-th_best_label]}` -- a small
+sorted-by-cash-descending list per `(node, hop)` instead of a single label.
+The transition step is otherwise identical to the `rank=1` DP: every
+retained label at `(node, hop - 1)` tries every ship-range-viable outgoing
+edge exactly as `_best_trade_for_edge` already does, producing one candidate
+per `(label, edge)` pair; candidates are grouped by destination node
+(merging contributions from *every* predecessor feeding that node at this
+hop, not just one edge's worth), then each destination's candidate pool is
+truncated down to its own top-`rank` by cash. The final answer gathers every
+retained label across every `(node, hop)` with `hop <= num_hops`, keeps only
+the ones with `cash > starting_budget` (same "found" semantics as `rank=1`
+-- a neutral/unprofitable label is not a "route" for ranking purposes
+either), sorts that pool by cash descending, and returns the element at
+1-indexed position `rank` -- or, if fewer than `rank` profitable labels
+exist at all, clamps down to the least-profitable one actually found
+(`RouteSearchResult.actual_rank_used` records which rank was actually used,
+distinct from `requested_rank` only when this clamp fires). If *no*
+profitable label exists at all, the result is `found=False` regardless of
+what rank was requested -- identical "no profitable route" semantics to
+`rank=1`, just evaluated against the whole pool instead of a single label.
+
+State space for `rank > 1` is `O(nodes * num_hops * rank)` for retained
+labels, with `O(nodes * num_hops * rank * average_out_degree)` candidate
+labels considered along the way (each hop's every retained label tries
+every outgoing edge, same as the `rank=1` DP just multiplied by up to
+`rank` starting labels per node) -- still small and exactly bounded by
+construction, no heuristic safety valve needed, though the existing
+`settings.search_time_budget_seconds` anytime check still applies as
+defense in depth (see `tests/perf/test_perf.py` for freshly-measured
+`rank=10` timing).
 """
 
 from __future__ import annotations
@@ -197,6 +278,19 @@ class RouteSearchResult:
     `total_profit == 0.0`, kept consistent by construction here for the
     same reason `RouteResponse` enforces an analogous invariant at the
     schema layer.
+
+    `requested_rank`/`actual_rank_used` (Phase 3's top-K route ranking --
+    see module docstring's "Phase 3: top-K route ranking" section):
+    `requested_rank` is simply the `rank` `find_best_route` was called with.
+    `actual_rank_used` is the 1-indexed position, within the sorted-by-cash-
+    descending pool of every genuinely profitable (`cash > starting_budget`)
+    label found, of the route actually returned -- `1` for the `rank=1`
+    path (and for a `rank > 1` request that found at least `rank` distinct
+    profitable routes), clamped down to whatever *was* found when fewer
+    than `requested_rank` distinct profitable routes exist (never
+    `found=False` merely because the requested rank was too high, as long
+    as at least one profitable route exists at all). `actual_rank_used == 0`
+    whenever `found is False` -- no route was returned to attach a rank to.
     """
 
     found: bool
@@ -207,6 +301,8 @@ class RouteSearchResult:
     starting_budget: float = 0.0
     final_cash: float = 0.0
     message: str | None = None
+    requested_rank: int = 1
+    actual_rank_used: int = 0
 
 
 def _best_trade_for_edge(
@@ -334,14 +430,30 @@ def _hops_from_chain(chain: list["_Label"]) -> tuple[RouteHopResult, ...]:
     return tuple(hops)
 
 
-def _not_found(start_terminal_id: int, starting_budget: float) -> RouteSearchResult:
+def _not_found(
+    start_terminal_id: int, starting_budget: float, requested_rank: int = 1
+) -> RouteSearchResult:
     return RouteSearchResult(
         found=False,
         start_terminal_id=start_terminal_id,
         starting_budget=starting_budget,
         final_cash=starting_budget,
         message=_NO_ROUTE_MESSAGE,
+        requested_rank=requested_rank,
+        actual_rank_used=0,
     )
+
+
+def _top_k_by_cash(labels: list["_Label"], k: int) -> list["_Label"]:
+    """Return (up to) the `k` highest-cash labels from `labels`, sorted
+    descending by cash. Ties preserve `labels`' original relative order
+    (`sorted` is stable) -- with `hop_labels` built up in deterministic
+    iteration order (dict insertion order + `graph.successors()`'s
+    deterministic order), this keeps `_find_top_k_routes` deterministic
+    run to run for a fixed graph/inputs, same as `_find_single_best_route`
+    already is.
+    """
+    return sorted(labels, key=lambda label: label.cash, reverse=True)[:k]
 
 
 def find_best_route(
@@ -354,13 +466,23 @@ def find_best_route(
     buy_prices: dict[int, dict[int, float]],
     sell_prices: dict[int, dict[int, float]],
     settings: Settings | None = None,
+    rank: int = 1,
 ) -> RouteSearchResult:
-    """Bounded DP search for the max-final-cash walk of at most `num_hops`
-    hops from `start_terminal_id`, subject to `ship_jump_range_gm` (per-hop
-    distance filter) and `ship_cargo_capacity_scu` (per-hop quantity cap).
-    See module docstring for the full algorithm description and its
+    """Bounded DP search for the `rank`-th best (by final cash) distinct
+    walk of at most `num_hops` hops from `start_terminal_id`, subject to
+    `ship_jump_range_gm` (per-hop distance filter) and
+    `ship_cargo_capacity_scu` (per-hop quantity cap). See module docstring
+    for the full algorithm description -- both the original `rank=1`
+    single-best DP and Phase 3's top-K generalization -- and its
     "Validation is the caller's job" section for what this function does
     and doesn't check on your behalf.
+
+    `rank` defaults to `1`: the single best route, identical in behavior and
+    performance to the pre-Phase-3 algorithm (dispatches straight to
+    `_find_single_best_route`, which is that original implementation,
+    untouched). `rank > 1` dispatches to `_find_top_k_routes`, the
+    generalized top-K DP -- see module docstring's "Phase 3: top-K route
+    ranking" section for the correctness argument.
     """
     settings = settings or get_settings()
 
@@ -370,9 +492,55 @@ def find_best_route(
         or starting_budget < 0
         or ship_jump_range_gm <= 0
         or ship_cargo_capacity_scu < 0
+        or rank < 1
     ):
-        return _not_found(start_terminal_id, starting_budget)
+        return _not_found(start_terminal_id, starting_budget, requested_rank=rank)
 
+    if rank == 1:
+        return _find_single_best_route(
+            graph,
+            start_terminal_id,
+            num_hops,
+            starting_budget,
+            ship_jump_range_gm,
+            ship_cargo_capacity_scu,
+            buy_prices,
+            sell_prices,
+            settings,
+        )
+
+    return _find_top_k_routes(
+        graph,
+        start_terminal_id,
+        num_hops,
+        starting_budget,
+        ship_jump_range_gm,
+        ship_cargo_capacity_scu,
+        buy_prices,
+        sell_prices,
+        settings,
+        rank,
+    )
+
+
+def _find_single_best_route(
+    graph: nx.DiGraph,
+    start_terminal_id: int,
+    num_hops: int,
+    starting_budget: float,
+    ship_jump_range_gm: float,
+    ship_cargo_capacity_scu: float,
+    buy_prices: dict[int, dict[int, float]],
+    sell_prices: dict[int, dict[int, float]],
+    settings: Settings,
+) -> RouteSearchResult:
+    """The original Phase 2 algorithm, unmodified: a single best-cash label
+    per `(node, hop)`, no top-K bookkeeping at all. Called only for
+    `rank == 1` (all inputs already validated by `find_best_route`) -- this
+    is what makes `rank=1` byte-for-byte identical in behavior and
+    performance to before Phase 3 existed. See module docstring's "Why this
+    needs no Pareto frontier" section.
+    """
     start_label = _Label(
         node=start_terminal_id, hops_used=0, cash=starting_budget, previous=None
     )
@@ -433,7 +601,7 @@ def find_best_route(
             break
 
     if best_label.cash <= starting_budget:
-        return _not_found(start_terminal_id, starting_budget)
+        return _not_found(start_terminal_id, starting_budget, requested_rank=1)
 
     chain = _chain_from_label(best_label)
     hops = _hops_from_chain(chain)
@@ -445,4 +613,129 @@ def find_best_route(
         total_profit=best_label.cash - starting_budget,
         starting_budget=starting_budget,
         final_cash=best_label.cash,
+        requested_rank=1,
+        actual_rank_used=1,
+    )
+
+
+def _find_top_k_routes(
+    graph: nx.DiGraph,
+    start_terminal_id: int,
+    num_hops: int,
+    starting_budget: float,
+    ship_jump_range_gm: float,
+    ship_cargo_capacity_scu: float,
+    buy_prices: dict[int, dict[int, float]],
+    sell_prices: dict[int, dict[int, float]],
+    settings: Settings,
+    rank: int,
+) -> RouteSearchResult:
+    """Phase 3's generalized top-K DP. Called only for `rank > 1` (all
+    inputs already validated by `find_best_route`). See module docstring's
+    "Phase 3: top-K route ranking" section for the full mechanics and
+    correctness argument -- summary: identical transition step to
+    `_find_single_best_route`, just applied to every one of a `(node, hop)`
+    state's up-to-`rank` retained labels instead of only the single best,
+    with every predecessor's contributions merged into each destination
+    state before that state's own top-`rank` set is (re)selected.
+    """
+    start_label = _Label(
+        node=start_terminal_id, hops_used=0, cash=starting_budget, previous=None
+    )
+
+    # `hop_labels[h]` is `{node: [best_label, ..., up to rank-th_best_label]}`,
+    # sorted descending by cash -- the top-K generalization of
+    # `_find_single_best_route`'s `{node: best_label}`.
+    hop_labels: list[dict[int, list[_Label]]] = [{start_terminal_id: [start_label]}]
+
+    deadline = time.monotonic() + settings.search_time_budget_seconds
+
+    for hop in range(1, num_hops + 1):
+        previous_frontier = hop_labels[hop - 1]
+        if not previous_frontier:
+            break  # no label survived to the previous hop -- nothing further to expand
+
+        # Every retained label at every predecessor node contributes its
+        # candidates here first; only once every predecessor's edges have
+        # been tried is each destination node's pool truncated down to its
+        # own top-`rank` -- this is what "merged into the destination
+        # (node, hop)'s own top-rank set, competing with labels arriving
+        # from OTHER predecessor nodes too" means in practice.
+        raw_candidates: dict[int, list[_Label]] = {}
+        for node, labels in previous_frontier.items():
+            for label in labels:
+                for successor in graph.successors(node):
+                    edge = graph.edges[node, successor]
+                    distance = edge["distance"]
+                    if distance > ship_jump_range_gm:
+                        continue
+
+                    commodity_id, quantity, buy_price, sell_price, profit = _best_trade_for_edge(
+                        node,
+                        successor,
+                        label.cash,
+                        buy_prices,
+                        sell_prices,
+                        ship_cargo_capacity_scu,
+                    )
+                    candidate = _Label(
+                        node=successor,
+                        hops_used=hop,
+                        cash=label.cash + profit,
+                        previous=label,
+                        distance_from_previous=distance,
+                        commodity_id=commodity_id,
+                        quantity_traded=quantity,
+                        unit_buy_price=buy_price,
+                        unit_sell_price=sell_price,
+                        profit=profit,
+                    )
+                    raw_candidates.setdefault(successor, []).append(candidate)
+
+        current_frontier: dict[int, list[_Label]] = {
+            node: _top_k_by_cash(candidates, rank) for node, candidates in raw_candidates.items()
+        }
+        hop_labels.append(current_frontier)
+
+        if time.monotonic() >= deadline:
+            logger.info(
+                "route search (rank=%d): time budget exhausted after hop %d/%d, returning best found",
+                rank,
+                hop,
+                num_hops,
+            )
+            break
+
+    # Gather every retained label across every (node, hop) actually
+    # computed (hop=0's start label included, but it can never pass the
+    # `cash > starting_budget` filter -- cash is unchanged there by
+    # definition). Same "found" semantics as `_find_single_best_route`:
+    # only strictly-profitable labels count as a "route" at all.
+    profitable = [
+        label
+        for frontier in hop_labels
+        for labels in frontier.values()
+        for label in labels
+        if label.cash > starting_budget
+    ]
+
+    if not profitable:
+        return _not_found(start_terminal_id, starting_budget, requested_rank=rank)
+
+    profitable.sort(key=lambda label: label.cash, reverse=True)
+    actual_rank_used = min(rank, len(profitable))
+    winning_label = profitable[actual_rank_used - 1]
+
+    chain = _chain_from_label(winning_label)
+    hops = _hops_from_chain(chain)
+    return RouteSearchResult(
+        found=True,
+        start_terminal_id=start_terminal_id,
+        hops=hops,
+        total_distance=sum(hop.distance_from_previous for hop in hops),
+        total_profit=winning_label.cash - starting_budget,
+        starting_budget=starting_budget,
+        final_cash=winning_label.cash,
+        requested_rank=rank,
+        actual_rank_used=actual_rank_used,
     )

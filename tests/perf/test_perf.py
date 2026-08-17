@@ -239,6 +239,72 @@ def test_search_perf_on_large_dense_graph():
     assert result.final_cash > result.starting_budget
 
 
+def test_search_perf_on_large_dense_graph_rank10():
+    # Phase 3: the same 300-node, out-degree-60 graph as
+    # `test_search_perf_on_large_dense_graph` above, but exercising
+    # `_find_top_k_routes` (rank=10) instead of `_find_single_best_route`
+    # (rank=1) -- the top-K bookkeeping (retaining/merging/re-sorting up to
+    # `rank` labels per (node, hop) instead of just 1, and trying every
+    # outgoing edge from every one of those retained labels instead of only
+    # the single best) is real additional work, bounded by `nodes *
+    # num_hops * rank * out_degree` candidate labels considered per the
+    # module docstring's "Phase 3" section.
+    #
+    # Deliberately uses num_hops=50 here, not 200 like the rank=1 benchmark
+    # above -- freshly measured (2026-08-16) at num_hops=200, rank=10 took
+    # ~107s (20.33s/47.55s/107.22s at 50/100/200 hops respectively, roughly
+    # linear in num_hops as expected), which is too slow for a perf test
+    # meant to be run repeatedly during iteration even though `-m perf` is
+    # already opt-in/excluded from the default suite. num_hops=50 still
+    # produces a large retained state space (300 * 50 * 10 = 150,000
+    # retained labels, the same order of magnitude as the rank=1 20,000-
+    # hop... i.e. 300 * 200 = 60,000-(node,hop)-pair benchmark above) while
+    # keeping the benchmark itself practical to run often.
+    #
+    # Freshly measured on this machine (2026-08-16, Phase 3 Task 20), 3
+    # consecutive runs at num_hops=50: 20.78s, 20.52s, 20.45s -- roughly
+    # 5x slower than the rank=1 DP would take at the same 50-hop depth
+    # (consistent with rank=10's ~10x more retained labels per state,
+    # partially offset by the fact that fewer than out_degree=60 successors
+    # end up novel per destination once results converge). 90.0s (~4.4x the
+    # measured baseline) is generous enough to stay reliable on a slower/
+    # loaded machine while still catching a real regression (e.g. an
+    # accidental O(depth) path materialization per candidate instead of
+    # only the final winner, or truncating per-edge instead of merging all
+    # of a state's predecessors before truncating).
+    node_count = 300
+    out_degree = 60
+    num_hops = 50
+    graph, buy_prices, sell_prices = _large_synthetic_graph_and_prices(
+        node_count=node_count, out_degree=out_degree
+    )
+    settings = Settings(search_time_budget_seconds=120.0)
+
+    started = time.monotonic()
+    result = find_best_route(
+        graph,
+        start_terminal_id=0,
+        num_hops=num_hops,
+        starting_budget=1000.0,
+        ship_jump_range_gm=1000.0,  # generous -- the distance filter is not the thing under test
+        ship_cargo_capacity_scu=1_000_000.0,
+        buy_prices=buy_prices,
+        sell_prices=sell_prices,
+        settings=settings,
+        rank=10,
+    )
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 90.0, (
+        f"find_best_route(rank=10) took {elapsed:.2f}s on a {node_count}-node, "
+        f"{num_hops}-hop search"
+    )
+    assert result.found is True
+    assert result.requested_rank == 10
+    assert result.actual_rank_used == 10  # this dense/cyclic graph has well over 10 distinct profitable routes
+    assert result.final_cash > result.starting_budget
+
+
 def test_search_respects_time_budget_on_large_dense_graph():
     # A tighter time budget than the graph would naturally finish within --
     # confirms the deadline check actually fires and still returns a
@@ -275,6 +341,66 @@ def test_search_respects_time_budget_on_large_dense_graph():
     # not to enforce it to the millisecond.
     assert elapsed < settings.search_time_budget_seconds + 5.0, (
         f"find_best_route() took {elapsed:.2f}s against a "
+        f"{settings.search_time_budget_seconds}s budget"
+    )
+    if result.found:
+        assert len(result.hops) >= 1
+        assert len(result.hops) < 2000  # the deadline must have cut this well short
+    else:
+        assert result.hops == ()
+
+
+def test_search_respects_time_budget_on_large_dense_graph_rank10():
+    # Phase 3 regression guard: the same tight-deadline scenario as
+    # `test_search_respects_time_budget_on_large_dense_graph` above, but
+    # exercising `_find_top_k_routes` (rank=10) instead of
+    # `_find_single_best_route` (rank=1) -- confirms the anytime safety
+    # valve (`settings.search_time_budget_seconds`, checked once between
+    # fully-computed hop levels) genuinely fires on the top-K path too, not
+    # only the rank=1 path, and still returns a well-formed "best found so
+    # far" answer rather than running unconditionally to completion or
+    # crashing. This is a real, separate code path from rank=1
+    # (`_find_top_k_routes` has its own deadline check and its own loop),
+    # so rank=1 passing this doesn't already prove rank=10 does.
+    #
+    # Freshly measured on this machine (2026-08-16, Phase 3 Task 20), 3
+    # consecutive runs against a 0.05s budget: 0.281s, 0.312s, 0.313s --
+    # only 3 hop levels complete before the deadline check stops it (each
+    # rank=10 hop level does more work than a rank=1 one -- more retained
+    # labels per state, each trying every outgoing edge, plus the top-K
+    # re-sort -- so fewer hop levels finish in the same wall-clock window
+    # than the rank=1 version manages, but the deadline still fires
+    # promptly rather than being ignored).
+    node_count = 300
+    out_degree = 60
+    graph, buy_prices, sell_prices = _large_synthetic_graph_and_prices(
+        node_count=node_count, out_degree=out_degree
+    )
+    settings = Settings(search_time_budget_seconds=0.05)
+
+    started = time.monotonic()
+    result = find_best_route(
+        graph,
+        start_terminal_id=0,
+        num_hops=2000,  # far more hops than a 0.05s budget can fully compute
+        starting_budget=1000.0,
+        ship_jump_range_gm=1000.0,
+        ship_cargo_capacity_scu=1_000_000.0,
+        buy_prices=buy_prices,
+        sell_prices=sell_prices,
+        settings=settings,
+        rank=10,
+    )
+    elapsed = time.monotonic() - started
+
+    # Same generous slack rationale as the rank=1 version above -- the
+    # deadline is only checked once per fully-completed hop level, and a
+    # rank=10 hop level does more work per level than rank=1's, but the
+    # freshly-measured ~0.28-0.31s overshoot is still tiny in absolute
+    # terms, so the same +5.0s slack comfortably covers a slower/loaded
+    # machine too.
+    assert elapsed < settings.search_time_budget_seconds + 5.0, (
+        f"find_best_route(rank=10) took {elapsed:.2f}s against a "
         f"{settings.search_time_budget_seconds}s budget"
     )
     if result.found:
