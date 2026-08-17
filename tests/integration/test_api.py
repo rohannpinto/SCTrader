@@ -22,6 +22,8 @@ freshly-initialized, empty temp DB and an empty graph.
 from __future__ import annotations
 
 import json
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -33,8 +35,9 @@ from fastapi.testclient import TestClient
 import backend.graph.cache as cache_module
 import backend.models.db as db_module
 from backend.graph.cache import get_graph_cache
-from backend.models.db import Commodity, Distance, Price, Ship, Terminal, session_scope
+from backend.models.db import Commodity, Distance, Price, RefreshRun, Ship, Terminal, session_scope
 from backend.rate_limit import limiter
+from backend.routers import refresh as refresh_router
 from backend.routers.route import _cached_search
 
 WIKI_BASE = "https://api.star-citizen.wiki/api"
@@ -688,3 +691,358 @@ def test_refresh_rate_limit_returns_429_once_exceeded(client, monkeypatch):
 
     assert statuses[:5] == [401] * 5
     assert statuses[5] == 429
+
+
+# --- shared refresh-trigger function: backend.routers.refresh.run_refresh_cycle -------
+#
+# Tested directly (no HTTP, no scheduler) for its three transport-agnostic
+# outcomes -- Task 19. `trigger_refresh`'s existing tests above are left
+# completely unmodified; their continued passing is what proves this
+# extraction didn't change the HTTP-visible behavior of `/refresh`.
+
+
+def _mock_minimal_successful_refresh() -> None:
+    """Sets up the same minimal-but-successful respx mock set used by
+    `test_refresh_success_updates_status_and_graph_cache` above, factored
+    out so `run_refresh_cycle`'s own success test can reuse it without
+    going through `client.post("/refresh")`.
+    """
+    respx.get(f"{UEX_BASE}/terminals").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "status": "ok",
+                "data": [
+                    {
+                        "id": 1,
+                        "name": "Terminal A",
+                        "code": "TERMA",
+                        "type": "commodity",
+                        "id_star_system": 55,
+                        "id_orbit": 100,
+                        "star_system_name": "Nyx",
+                    }
+                ],
+                "message": "",
+            },
+        )
+    )
+    respx.get(f"{WIKI_BASE}/commodities").mock(
+        return_value=httpx.Response(
+            200,
+            json={"data": [], "links": {"next": None}, "meta": {"current_page": 1, "last_page": 1}},
+        )
+    )
+    respx.get(f"{UEX_BASE}/star_systems").mock(
+        return_value=httpx.Response(200, json=_load_fixture("uex_star_systems_sample.json"))
+    )
+    for system_id in (55, 64, 68):
+        respx.get(f"{UEX_BASE}/orbits_distances", params={"id_star_system": system_id}).mock(
+            return_value=httpx.Response(200, json={"status": "ok", "data": [], "message": ""})
+        )
+    respx.get(f"{WIKI_BASE}/vehicles").mock(
+        return_value=httpx.Response(
+            200,
+            json={"data": [], "links": {"next": None}, "meta": {"current_page": 1, "last_page": 1}},
+        )
+    )
+
+
+def test_run_refresh_cycle_ran_and_succeeded(client):
+    from backend.config import get_settings
+
+    with respx.mock:
+        _mock_minimal_successful_refresh()
+        result = refresh_router.run_refresh_cycle(get_settings())
+
+    assert result.outcome is refresh_router.RefreshTriggerOutcome.RAN
+    assert result.run is not None
+    assert result.run.status == "success"
+    assert result.snapshot is not None
+    assert result.snapshot.data_version == result.run.id
+    # The graph cache was actually rebuilt from the freshly-written data --
+    # not just "run_refresh() succeeded" bookkeeping.
+    assert get_graph_cache().get_snapshot().data_version == result.run.id
+
+
+def test_run_refresh_cycle_ran_and_failed(client):
+    from backend.config import get_settings
+
+    with respx.mock:
+        respx.get(f"{UEX_BASE}/terminals").mock(
+            return_value=httpx.Response(500, json={"status": "error", "message": "boom"})
+        )
+        result = refresh_router.run_refresh_cycle(get_settings())
+
+    assert result.outcome is refresh_router.RefreshTriggerOutcome.RAN
+    assert result.run is not None
+    assert result.run.status == "failed"
+    assert result.snapshot is not None
+
+
+def test_run_refresh_cycle_skipped_due_to_overlap(client):
+    from backend.config import get_settings
+
+    assert refresh_router._refresh_lock.acquire(blocking=False)
+    try:
+        result = refresh_router.run_refresh_cycle(get_settings())
+    finally:
+        refresh_router._refresh_lock.release()
+
+    assert result.outcome is refresh_router.RefreshTriggerOutcome.SKIPPED_OVERLAP
+    assert result.run is None
+    assert result.snapshot is None
+
+
+# --- auto-refresh scheduler: backend.main -----------------------------------------
+#
+# None of these wait out a real interval -- `_auto_refresh_tick` (one tick's
+# worth of work) is tested directly wherever possible, and the two tests
+# that do exercise the real background thread use either an
+# already-`set()` stop event (interrupts an otherwise-huge wait instantly)
+# or a zero-minute interval (times out instantly, with only a short bounded
+# poll for thread scheduling -- never a sleep anywhere near real minutes).
+
+
+def test_auto_refresh_scheduler_thread_starts_and_stops_cleanly_when_enabled(engine, monkeypatch):
+    from backend.config import get_settings
+    from backend.main import _SCHEDULER_THREAD_NAME, app
+
+    monkeypatch.setattr(get_settings(), "auto_refresh_enabled", True)
+    monkeypatch.setattr(get_settings(), "auto_refresh_interval_minutes", 60)
+
+    with TestClient(app, raise_server_exceptions=False):
+        assert _SCHEDULER_THREAD_NAME in {t.name for t in threading.enumerate()}
+
+    # Shutdown (lifespan's stop_event.set() + bounded join()) must have
+    # actually stopped the thread promptly, not merely returned control
+    # while a 60-minute wait kept running in the background -- if the
+    # stop-event mechanism didn't interrupt the wait, the thread would
+    # still be alive and enumerable here.
+    assert _SCHEDULER_THREAD_NAME not in {t.name for t in threading.enumerate()}
+
+
+def test_auto_refresh_scheduler_disabled_starts_no_thread(engine, monkeypatch):
+    from backend.config import get_settings
+    from backend.main import _SCHEDULER_THREAD_NAME, app
+
+    monkeypatch.setattr(get_settings(), "auto_refresh_enabled", False)
+
+    with TestClient(app, raise_server_exceptions=False):
+        assert _SCHEDULER_THREAD_NAME not in {t.name for t in threading.enumerate()}
+
+
+def test_auto_refresh_tick_calls_shared_refresh_function(monkeypatch):
+    import backend.main as main_module
+    from backend.config import get_settings
+
+    calls = []
+
+    def fake_run_refresh_cycle(settings):
+        calls.append(settings)
+        return refresh_router.RefreshTriggerResult(
+            outcome=refresh_router.RefreshTriggerOutcome.RAN, run=None, snapshot=None
+        )
+
+    monkeypatch.setattr(main_module, "run_refresh_cycle", fake_run_refresh_cycle)
+
+    settings = get_settings()
+    main_module._auto_refresh_tick(settings)
+
+    assert calls == [settings]
+
+
+def test_auto_refresh_tick_skipped_when_refresh_already_in_progress(client, monkeypatch):
+    import backend.main as main_module
+    from backend.config import get_settings
+
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("run_refresh() must not be called when _refresh_lock is already held")
+
+    # `run_refresh_cycle` is exercised for real here (not mocked) -- only
+    # the thing it would call *after* successfully acquiring the lock is
+    # stubbed to blow up, so this proves the overlap guard itself (not a
+    # mock) is what prevents the tick from proceeding.
+    monkeypatch.setattr(refresh_router, "run_refresh", _fail_if_called)
+
+    with session_scope() as session:
+        before_count = session.query(RefreshRun).count()
+
+    assert refresh_router._refresh_lock.acquire(blocking=False)
+    try:
+        main_module._auto_refresh_tick(get_settings())  # must not raise, must not call run_refresh
+    finally:
+        refresh_router._refresh_lock.release()
+
+    with session_scope() as session:
+        after_count = session.query(RefreshRun).count()
+    assert after_count == before_count
+
+
+def test_auto_refresh_loop_stop_event_interrupts_wait_immediately(monkeypatch):
+    import backend.main as main_module
+    from backend.config import get_settings
+
+    # The largest interval Settings actually allows in production
+    # (auto_refresh_interval_minutes' new le=4_320 bound, 3 days = 259,200
+    # seconds) -- large enough that if the stop-event interrupt didn't
+    # genuinely work, the thread would still be waiting when this test's
+    # bounded join() times out, but nowhere near the ~4,294,967-second
+    # Windows Event.wait() ceiling a much larger value used to hit (see
+    # test_auto_refresh_loop_survives_interval_that_used_to_overflow below
+    # for that specific regression). This version proves the interrupt
+    # mechanism itself, not an accidental crash.
+    monkeypatch.setattr(get_settings(), "auto_refresh_interval_minutes", 4_320)
+
+    tick_calls = []
+    monkeypatch.setattr(main_module, "_auto_refresh_tick", lambda settings: tick_calls.append(settings))
+
+    stop_event = threading.Event()
+    thread = threading.Thread(
+        target=main_module._auto_refresh_loop,
+        args=(get_settings(), stop_event),
+        daemon=True,
+    )
+    start = time.monotonic()
+    thread.start()
+    stop_event.set()
+    thread.join(timeout=5.0)
+    elapsed = time.monotonic() - start
+
+    assert not thread.is_alive()
+    assert elapsed < 5.0
+    assert tick_calls == []  # stopped before ever firing a tick
+
+
+def test_auto_refresh_loop_survives_interval_that_used_to_overflow(monkeypatch):
+    """Regression guard for the exact bug a reviewer caught: on this Windows
+    Python build, `threading.Event.wait()`'s `timeout` is bounded by the
+    underlying `WaitForSingleObject` API's DWORD-milliseconds ceiling
+    (~4,294,967 seconds =~ 49.7 days). Before `_wait_for_interval_or_stop`'s
+    chunking existed, a single `stop_event.wait(timeout=interval_seconds)`
+    call for an interval this large raised an immediate, unhandled
+    `OverflowError` that killed the scheduler thread silently -- the loop
+    "exited" in ~0 seconds via a crash, not via a real interrupt (which is
+    exactly why the old version of the test above, using this same
+    magnitude of interval, was a false positive: it couldn't tell a crash
+    from a working interrupt).
+
+    This interval (999,999 minutes =~ 1.9 years) is far larger than
+    `Settings.auto_refresh_interval_minutes`'s new `le=4_320` bound allows
+    in production -- set here via `monkeypatch` exactly like every other
+    test in this file sets `Settings` fields directly, deliberately
+    bypassing that bound. The point of *this* test is to prove the
+    chunked-wait mechanism itself is what makes an oversized interval safe
+    now, independently of the config-level guard added alongside it.
+    """
+    import backend.main as main_module
+    from backend.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "auto_refresh_interval_minutes", 999_999)
+    # A tiny chunk size so several real chunk boundaries elapse within the
+    # test's short run -- proves the loop actually keeps re-checking the
+    # stop event between chunks, not merely that construction/the first
+    # call avoids crashing.
+    monkeypatch.setattr(main_module, "_MAX_SINGLE_WAIT_SECONDS", 0.05)
+
+    tick_calls = []
+    monkeypatch.setattr(main_module, "_auto_refresh_tick", lambda settings: tick_calls.append(settings))
+
+    errors: list[BaseException] = []
+
+    def _run() -> None:
+        try:
+            main_module._auto_refresh_loop(get_settings(), stop_event)
+        except BaseException as exc:  # pragma: no cover - only hit on a real regression
+            errors.append(exc)
+
+    stop_event = threading.Event()
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    time.sleep(0.2)  # let several 0.05s chunks genuinely elapse for real
+    stop_event.set()
+    thread.join(timeout=5.0)
+
+    assert not thread.is_alive()
+    assert errors == []  # no OverflowError (or anything else) escaped the loop
+    assert tick_calls == []  # stopped long before the huge interval could fully elapse
+
+
+def test_auto_refresh_loop_logs_and_continues_after_unexpected_exception(monkeypatch, caplog):
+    """Defense-in-depth check: an exception from the loop machinery itself
+    (not from `run_refresh_cycle`, which `_auto_refresh_tick` already
+    handles on its own) must be logged and must not kill the thread --
+    `backend/logging_config.py` never hooks `threading.excepthook`, so an
+    uncaught exception here would otherwise vanish with no trace at all.
+    """
+    import logging as logging_module
+
+    import backend.main as main_module
+    from backend.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "auto_refresh_interval_minutes", 60)
+
+    real_wait = main_module._wait_for_interval_or_stop
+    call_count = {"n": 0}
+
+    def _wait_raise_once_then_real(interval_seconds, stop_event):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise RuntimeError("simulated unexpected bug in the wait helper")
+        return real_wait(interval_seconds, stop_event)
+
+    tick_calls = []
+    monkeypatch.setattr(main_module, "_wait_for_interval_or_stop", _wait_raise_once_then_real)
+    monkeypatch.setattr(main_module, "_auto_refresh_tick", lambda settings: tick_calls.append(settings))
+
+    stop_event = threading.Event()
+    thread = threading.Thread(
+        target=main_module._auto_refresh_loop,
+        args=(get_settings(), stop_event),
+        daemon=True,
+    )
+
+    with caplog.at_level(logging_module.ERROR, logger="backend.main"):
+        thread.start()
+        deadline = time.monotonic() + 2.0
+        while call_count["n"] < 1 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        stop_event.set()
+        thread.join(timeout=5.0)
+
+    assert not thread.is_alive()
+    assert call_count["n"] >= 2  # the loop retried after the exception instead of dying
+    assert tick_calls == []  # never reached a tick in this test
+    assert "unexpected exception" in caplog.text.lower()
+
+
+def test_auto_refresh_loop_fires_tick_then_stops_cleanly(monkeypatch):
+    import backend.main as main_module
+    from backend.config import get_settings
+
+    # 0 minutes -> Event.wait(timeout=0) always times out instantly, so the
+    # loop fires ticks back-to-back without waiting out any real interval.
+    monkeypatch.setattr(get_settings(), "auto_refresh_interval_minutes", 0)
+
+    tick_calls = []
+    monkeypatch.setattr(main_module, "_auto_refresh_tick", lambda settings: tick_calls.append(settings))
+
+    stop_event = threading.Event()
+    thread = threading.Thread(
+        target=main_module._auto_refresh_loop,
+        args=(get_settings(), stop_event),
+        daemon=True,
+    )
+    thread.start()
+
+    # Bounded poll purely for thread scheduling, never for the interval
+    # itself (interval is 0) -- caps out at 2s worst case.
+    deadline = time.monotonic() + 2.0
+    while not tick_calls and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    stop_event.set()
+    thread.join(timeout=5.0)
+
+    assert not thread.is_alive()
+    assert len(tick_calls) >= 1

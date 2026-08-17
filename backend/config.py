@@ -8,6 +8,7 @@ validated configuration object.
 
 from functools import lru_cache
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -44,6 +45,29 @@ class Settings(BaseSettings):
 
     # --- /refresh shared-secret gate (unset = disabled, local dev only) ---
     refresh_token: str | None = None
+
+    # --- Auto-refresh scheduler (Phase 3) ---
+    auto_refresh_enabled: bool = True
+    """When True, `backend/main.py`'s `lifespan` starts a background
+    `threading.Thread` that periodically triggers the same refresh cycle
+    `POST /refresh` uses (`backend.routers.refresh.run_refresh_cycle`).
+    Set False to disable entirely (manual-only refresh, Phase 2 behavior)."""
+    auto_refresh_interval_minutes: int = Field(default=60, ge=1, le=4_320)
+    """Minutes between automatic refresh attempts. Only consulted when
+    `auto_refresh_enabled` is True. Capped at 4,320 (3 days) -- a real-world
+    misconfiguration anywhere near that large would be pointless (a refresh
+    scheduler that fires less than twice a week isn't doing its job) and,
+    more importantly, values *far* larger than this once reached a genuine
+    platform bug: on this Windows Python build, `threading.Event.wait()`'s
+    `timeout` is bounded by the underlying `WaitForSingleObject` API's
+    DWORD-milliseconds parameter (~4,294,967 seconds =~ 49.7 days) -- a
+    single wait call for anything past that raised an immediate, unhandled
+    `OverflowError` that killed the background scheduler thread (`backend/
+    main.py`) silently, with no logging. `backend/main.py`'s
+    `_wait_for_interval_or_stop` now waits in bounded chunks regardless of
+    this value, so that specific crash can no longer happen either way --
+    this bound exists so a value anywhere near it fails fast and loudly at
+    settings-load time instead of relying solely on that runtime defense."""
 
     # --- Route search / graph thresholds ---
     # Phase 2: the continuous distance-budget model (distance_threshold_default/
