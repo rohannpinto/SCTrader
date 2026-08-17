@@ -120,6 +120,25 @@ class RouteRequest(BaseModel):
             "`settings.max_starting_budget_cap`."
         ),
     )
+    risk_level: int = Field(
+        default=10,
+        ge=0,
+        le=10,
+        description=(
+            "Phase 3 risk/reward slider, 0-10. Higher means more risk "
+            "tolerance -- a more-obvious, more-likely-already-contested "
+            "route; lower means a deliberately less-obvious (lower-ranked, "
+            "presumably less-contested) route. Mapped server-side "
+            "(`backend/routers/route.py`) to `find_best_route`'s 1-indexed "
+            "`rank` parameter via `rank = max(1, 10 - risk_level)` -- "
+            "`risk_level=10` (the default, preserving pre-Phase-3 behavior "
+            "for any caller that omits this field) -> `rank=1`, today's "
+            "single best route; `risk_level=0` -> `rank=10`, the 10th-best "
+            "distinct profitable route found (clamped down if fewer than "
+            "10 distinct profitable routes exist -- see `RouteResponse."
+            "actual_rank_used`)."
+        ),
+    )
 
 
 class RouteHop(BaseModel):
@@ -222,6 +241,38 @@ class RouteResponse(BaseModel):
         description=(
             "Human-readable explanation, mainly used when `found` is False "
             "(e.g. \"no profitable route found from this start\")."
+        ),
+    )
+    requested_rank: int = Field(
+        default=1,
+        ge=1,
+        le=10,
+        description=(
+            "The 1-indexed profitability rank that was actually searched "
+            "for, derived from the request's `risk_level` via "
+            "`rank = max(1, 10 - risk_level)` (see `RouteRequest.risk_level`). "
+            "This mirrors `backend/graph/search.py`'s `RouteSearchResult."
+            "requested_rank` verbatim -- it is the raw 1-10 DP rank, NOT the "
+            "0-10 `risk_level` scale the client sent: `1` is always \"the "
+            "single best route\" regardless of which `risk_level` produced "
+            "it. Compare against `actual_rank_used` to detect whether the "
+            "requested rank had to be clamped."
+        ),
+    )
+    actual_rank_used: int = Field(
+        default=0,
+        ge=0,
+        le=10,
+        description=(
+            "The 1-indexed profitability rank actually used to produce "
+            "this response. Equal to `requested_rank` unless fewer than "
+            "`requested_rank` distinct profitable routes existed, in which "
+            "case this is clamped down to the least-profitable route that "
+            "*was* found (CLAUDE.md's Phase 3 clamp behavior -- a too-high "
+            "requested rank never turns a genuinely profitable-but-lower-"
+            "ranked route into `found=False`). `0` iff `found` is False "
+            "(no route was returned to attach a rank to). Mirrors "
+            "`RouteSearchResult.actual_rank_used` verbatim."
         ),
     )
 

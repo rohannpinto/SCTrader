@@ -508,6 +508,264 @@ def test_route_multi_hop_realistic_search_produces_sane_final_cash(client, engin
         assert hop["profit_this_hop"] == 50.0
 
 
+# --- /route: risk_level -> rank mapping (Phase 3, Task 21) --------------------------
+
+
+def _seed_multi_route_scenario(engine):
+    """Terminals 1 (start) -> {2, 3, 5} -> {4}, mirroring tests/unit/
+    test_search.py::test_three_plus_distinct_routes_ranked_by_final_cash_exactly
+    exactly (renumbered so terminal ids start at 1: old node 3 -- the
+    hop-2 convergence node -- becomes new terminal 4; old node 5 stays 5).
+    Five distinct profitable routes from terminal 1, hand-verified final
+    cash (starting_budget=1000.0, ship cargo/jump-range huge so only cash
+    gates quantity and distance never filters an edge):
+      rank 1: 10000.0, path [2, 4]
+      rank 2: 6000.0,  path [3, 4]
+      rank 3: 3000.0,  path [3]
+      rank 4: 2500.0,  path [5]
+      rank 5: 2000.0,  path [2]
+    A requested rank > 5 clamps down to rank 5 (2000.0, path [2]).
+    """
+    with session_scope(engine) as session:
+        for terminal_id, name in [
+            (1, "Start"),
+            (2, "Node2"),
+            (3, "Node3"),
+            (4, "Node4"),
+            (5, "Node5"),
+        ]:
+            session.add(Terminal(id=terminal_id, name=name, is_commodity_trading=True))
+        for commodity_id in (1, 2, 3, 4):
+            session.add(
+                Commodity(
+                    id=commodity_id,
+                    wiki_uuid=f"u{commodity_id}",
+                    slug=f"c{commodity_id}",
+                    name=f"Commodity {commodity_id}",
+                )
+            )
+
+    _seed_ship(engine, quantum_range_gm=100.0, cargo_capacity_scu=10_000.0)
+
+    with session_scope(engine) as session:
+        for a, b in [(1, 2), (1, 3), (1, 5), (2, 4), (3, 4)]:
+            session.add(Distance(terminal_a_id=a, terminal_b_id=b, distance=5.0, fetched_at=_now()))
+
+        # Buy side.
+        session.add(Price(terminal_id=1, commodity_id=1, price_buy=10.0, price_sell=None, fetched_at=_now()))
+        session.add(Price(terminal_id=1, commodity_id=2, price_buy=5.0, price_sell=None, fetched_at=_now()))
+        session.add(Price(terminal_id=1, commodity_id=3, price_buy=8.0, price_sell=None, fetched_at=_now()))
+        session.add(Price(terminal_id=2, commodity_id=3, price_buy=5.0, price_sell=None, fetched_at=_now()))
+        session.add(Price(terminal_id=3, commodity_id=4, price_buy=10.0, price_sell=None, fetched_at=_now()))
+
+        # Sell side.
+        session.add(Price(terminal_id=2, commodity_id=1, price_buy=None, price_sell=20.0, fetched_at=_now()))
+        session.add(Price(terminal_id=3, commodity_id=2, price_buy=None, price_sell=15.0, fetched_at=_now()))
+        session.add(Price(terminal_id=5, commodity_id=3, price_buy=None, price_sell=20.0, fetched_at=_now()))
+        session.add(Price(terminal_id=4, commodity_id=3, price_buy=None, price_sell=25.0, fetched_at=_now()))
+        session.add(Price(terminal_id=4, commodity_id=4, price_buy=None, price_sell=20.0, fetched_at=_now()))
+
+    get_graph_cache().rebuild(engine=engine)
+
+
+def test_route_risk_level_to_rank_mapping_is_exactly_max_1_10_minus_risk_level():
+    from backend.routers.route import _rank_from_risk_level
+
+    assert _rank_from_risk_level(10) == 1  # endpoint: max risk tolerance -> best route
+    assert _rank_from_risk_level(0) == 10  # endpoint: risk-averse -> 10th-best route
+    assert _rank_from_risk_level(4) == 6  # a middle value
+    assert _rank_from_risk_level(9) == 1  # max(1, 1) == 1, not 0
+    assert _rank_from_risk_level(1) == 9
+
+
+def test_route_risk_level_10_and_0_return_genuinely_different_routes(client, engine):
+    _seed_multi_route_scenario(engine)
+
+    high_risk = client.post("/route", json=_valid_route_payload(num_hops=2, risk_level=10)).json()
+    low_risk = client.post("/route", json=_valid_route_payload(num_hops=2, risk_level=0)).json()
+
+    assert high_risk["found"] is True
+    assert low_risk["found"] is True
+
+    # risk_level=10 -> rank=1 -> the single best route.
+    assert high_risk["requested_rank"] == 1
+    assert high_risk["actual_rank_used"] == 1
+    assert high_risk["final_cash"] == 10000.0
+    assert [hop["terminal_id"] for hop in high_risk["hops"]] == [2, 4]
+
+    # risk_level=0 -> rank=10 -> clamps to the 5th (least-profitable found).
+    assert low_risk["requested_rank"] == 10
+    assert low_risk["actual_rank_used"] == 5
+    assert low_risk["final_cash"] == 2000.0
+    assert [hop["terminal_id"] for hop in low_risk["hops"]] == [2]
+
+    # Genuinely different results, not a coincidence of shared defaults.
+    assert high_risk["hops"] != low_risk["hops"]
+    assert high_risk["final_cash"] != low_risk["final_cash"]
+
+    # Higher risk_level (better-or-equal rank) never does worse in cash.
+    assert high_risk["final_cash"] >= low_risk["final_cash"]
+
+
+def test_route_risk_level_middle_value_returns_correct_rank(client, engine):
+    _seed_multi_route_scenario(engine)
+
+    response = client.post("/route", json=_valid_route_payload(num_hops=2, risk_level=8))
+    assert response.status_code == 200
+    body = response.json()
+    # risk_level=8 -> rank=max(1, 10-8)=2 -> the second-best route.
+    assert body["requested_rank"] == 2
+    assert body["actual_rank_used"] == 2
+    assert body["final_cash"] == 6000.0
+    assert [hop["terminal_id"] for hop in body["hops"]] == [3, 4]
+
+
+# --- /route: cache key correctness -- risk_level must not collide -------------------
+
+
+def test_route_cache_does_not_collide_across_different_risk_levels(client, engine):
+    """The real, convincing version of the cache-key test: issue risk_level=10
+    then risk_level=0 (known, hand-verified to produce DIFFERENT routes on
+    this seeded graph -- see `_seed_multi_route_scenario`'s docstring), then
+    re-issue risk_level=10 again and confirm it still returns risk_level=10's
+    original answer, not risk_level=0's. If the cache key omitted `rank`
+    (or `risk_level`), this second risk_level=10 request would collide on
+    the exact same key the risk_level=0 request just overwrote with a
+    different result -- this test would fail loudly if that regressed.
+    """
+    _seed_multi_route_scenario(engine)
+
+    first_high = client.post("/route", json=_valid_route_payload(num_hops=2, risk_level=10)).json()
+    low = client.post("/route", json=_valid_route_payload(num_hops=2, risk_level=0)).json()
+    second_high = client.post("/route", json=_valid_route_payload(num_hops=2, risk_level=10)).json()
+
+    assert first_high["final_cash"] == 10000.0
+    assert low["final_cash"] == 2000.0
+    # If risk_level weren't part of the cache key, this would incorrectly
+    # come back as 2000.0 (the low-risk request's cached entry, colliding
+    # on a key identical in every other component).
+    assert second_high == first_high
+    assert second_high["final_cash"] == 10000.0
+    assert second_high["final_cash"] != low["final_cash"]
+
+
+def test_route_cache_holds_distinct_entries_per_rank(client, engine):
+    """Direct inspection of the hand-rolled LRU: after two requests
+    differing only in `risk_level` (-> different `rank`), there must be two
+    distinct cache entries, not one overwriting the other."""
+    from backend.routers.route import _route_cache
+
+    _seed_multi_route_scenario(engine)
+
+    client.post("/route", json=_valid_route_payload(num_hops=2, risk_level=10))
+    client.post("/route", json=_valid_route_payload(num_hops=2, risk_level=0))
+
+    # Keys are (id(graph), start_terminal_id, ship_id, num_hops,
+    # starting_budget, rank, data_version) -- filter to this scenario's
+    # start_terminal_id=1/ship_id=1/num_hops=2/starting_budget=1000.0 and
+    # confirm both rank=1 (risk_level=10) and rank=10 (risk_level=0) are
+    # present as separate entries with different cached results.
+    matching = [
+        (key, result)
+        for key, result in _route_cache.items()
+        if key[1] == 1 and key[2] == 1 and key[3] == 2 and key[4] == 1000.0
+    ]
+    ranks_present = {key[5] for key, _ in matching}
+    assert {1, 10} <= ranks_present
+
+    by_rank = {key[5]: result for key, result in matching}
+    assert by_rank[1].final_cash != by_rank[10].final_cash
+
+
+# --- /route: clamped rank visibility (Task 20's clamp, surfaced at the API) ---------
+
+
+def test_route_response_surfaces_clamped_rank_when_insufficient_routes_exist(client, engine):
+    """Task 20's clamp scenario, confirmed at the API layer: seed a graph
+    with only ONE distinct profitable route, request a low risk_level
+    (-> a high rank) that asks for more distinct routes than exist, and
+    confirm the response's `actual_rank_used` reflects the clamp while
+    `requested_rank` still reflects what was actually asked for."""
+    with session_scope(engine) as session:
+        session.add(Terminal(id=1, name="A", is_commodity_trading=True))
+        session.add(Terminal(id=2, name="B", is_commodity_trading=True))
+        session.add(Commodity(id=1, wiki_uuid="u1", slug="laranite", name="Laranite"))
+    _seed_ship(engine, quantum_range_gm=1000.0, cargo_capacity_scu=100.0)
+
+    with session_scope(engine) as session:
+        session.add(Distance(terminal_a_id=1, terminal_b_id=2, distance=10.0, fetched_at=_now()))
+        session.add(
+            Price(terminal_id=1, commodity_id=1, price_buy=100.0, price_sell=None, fetched_at=_now())
+        )
+        session.add(
+            Price(terminal_id=2, commodity_id=1, price_buy=None, price_sell=200.0, fetched_at=_now())
+        )
+
+    get_graph_cache().rebuild(engine=engine)
+
+    # risk_level=0 -> rank=10, but only 1 distinct profitable route exists.
+    response = client.post(
+        "/route", json=_valid_route_payload(num_hops=1, starting_budget=1000.0, risk_level=0)
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["found"] is True
+    assert body["requested_rank"] == 10
+    assert body["actual_rank_used"] == 1
+    assert body["final_cash"] == 2000.0
+
+
+# --- /route: risk_level adversarial/malformed input never 500s ---------------------
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"risk_level": "not-an-int"},
+        {"risk_level": -1},
+        {"risk_level": 11},
+        {"risk_level": 5.5},
+        {"risk_level": None},
+        {"risk_level": 10**9},
+    ],
+)
+def test_route_risk_level_adversarial_input_returns_clean_4xx_not_500(client, overrides):
+    response = client.post("/route", json=_valid_route_payload(**overrides))
+    assert 400 <= response.status_code < 500
+
+
+def test_route_missing_risk_level_defaults_to_10_and_matches_pre_phase_3_behavior(client, engine):
+    """`risk_level` is optional with a default of `10` specifically so a
+    caller that never sends it (every existing test in this file above this
+    section, and every pre-Phase-3 client) keeps getting `rank=1` -- today's
+    exact single-best-route behavior, unchanged."""
+    with session_scope(engine) as session:
+        session.add(Terminal(id=1, name="A", is_commodity_trading=True))
+        session.add(Terminal(id=2, name="B", is_commodity_trading=True))
+        session.add(Commodity(id=1, wiki_uuid="u1", slug="laranite", name="Laranite"))
+    _seed_ship(engine, quantum_range_gm=1000.0, cargo_capacity_scu=100.0)
+
+    with session_scope(engine) as session:
+        session.add(Distance(terminal_a_id=1, terminal_b_id=2, distance=10.0, fetched_at=_now()))
+        session.add(
+            Price(terminal_id=1, commodity_id=1, price_buy=100.0, price_sell=None, fetched_at=_now())
+        )
+        session.add(
+            Price(terminal_id=2, commodity_id=1, price_buy=None, price_sell=200.0, fetched_at=_now())
+        )
+
+    get_graph_cache().rebuild(engine=engine)
+
+    payload = _valid_route_payload(num_hops=1, starting_budget=1000.0)
+    assert "risk_level" not in payload
+    response = client.post("/route", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["requested_rank"] == 1
+    assert body["actual_rank_used"] == 1
+    assert body["final_cash"] == 2000.0
+
+
 # --- /refresh-status --------------------------------------------------------------
 
 

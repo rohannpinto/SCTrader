@@ -96,6 +96,36 @@ def test_route_request_accepts_zero_starting_budget():
     assert req.starting_budget == 0.0
 
 
+def test_route_request_risk_level_defaults_to_10():
+    """Phase 3, Task 21: a caller that omits `risk_level` entirely must see
+    unchanged pre-Phase-3 behavior -- `risk_level=10` maps to `rank=1`,
+    today's single best route."""
+    req = RouteRequest(start_terminal_id=1, ship_id=1, num_hops=5, starting_budget=1000.0)
+    assert req.risk_level == 10
+
+
+@pytest.mark.parametrize("risk_level", [0, 1, 5, 9, 10])
+def test_route_request_accepts_risk_level_in_bounds(risk_level):
+    req = RouteRequest(
+        start_terminal_id=1, ship_id=1, num_hops=5, starting_budget=1000.0, risk_level=risk_level
+    )
+    assert req.risk_level == risk_level
+
+
+def test_route_request_rejects_risk_level_below_zero():
+    with pytest.raises(ValidationError):
+        RouteRequest(
+            start_terminal_id=1, ship_id=1, num_hops=5, starting_budget=1000.0, risk_level=-1
+        )
+
+
+def test_route_request_rejects_risk_level_above_ten():
+    with pytest.raises(ValidationError):
+        RouteRequest(
+            start_terminal_id=1, ship_id=1, num_hops=5, starting_budget=1000.0, risk_level=11
+        )
+
+
 # --- RouteHop / RouteResponse -----------------------------------------------
 
 
@@ -281,6 +311,78 @@ def test_route_response_accepts_total_profit_matching_cash_delta():
         total_profit=500.0,
     )
     assert response.total_profit == 500.0
+
+
+# --- RouteResponse: requested_rank / actual_rank_used (Phase 3, Task 21) ----
+
+
+def test_route_response_rank_fields_default_to_1_and_0():
+    """Mirrors `RouteSearchResult`'s dataclass defaults (`backend/graph/
+    search.py`) -- unspecified means "rank=1, no route to attach a used-rank
+    to yet"."""
+    response = RouteResponse(
+        start_terminal_id=1, found=False, starting_budget=1000.0, final_cash=1000.0
+    )
+    assert response.requested_rank == 1
+    assert response.actual_rank_used == 0
+
+
+def test_route_response_rank_fields_round_trip():
+    response = RouteResponse(
+        found=True,
+        start_terminal_id=1,
+        hops=[_sample_hop()],
+        starting_budget=1000.0,
+        final_cash=1500.0,
+        total_profit=500.0,
+        requested_rank=7,
+        actual_rank_used=3,
+    )
+    dumped = response.model_dump()
+    reloaded = RouteResponse.model_validate(dumped)
+    assert reloaded == response
+    assert reloaded.requested_rank == 7
+    assert reloaded.actual_rank_used == 3
+
+
+def test_route_response_rank_fields_surface_a_clamp():
+    """`requested_rank != actual_rank_used` is exactly how a client detects
+    that Task 20's clamp-when-insufficient-routes-exist behavior fired."""
+    clamped = RouteResponse(
+        found=True,
+        start_terminal_id=1,
+        hops=[_sample_hop()],
+        starting_budget=1000.0,
+        final_cash=1500.0,
+        total_profit=500.0,
+        requested_rank=8,
+        actual_rank_used=3,
+    )
+    assert clamped.requested_rank != clamped.actual_rank_used
+    assert clamped.actual_rank_used < clamped.requested_rank
+
+
+@pytest.mark.parametrize("bad_value", [-1, 11])
+def test_route_response_rejects_requested_rank_out_of_bounds(bad_value):
+    with pytest.raises(ValidationError):
+        RouteResponse(
+            start_terminal_id=1,
+            found=False,
+            starting_budget=1000.0,
+            final_cash=1000.0,
+            requested_rank=bad_value,
+        )
+
+
+def test_route_response_rejects_negative_actual_rank_used():
+    with pytest.raises(ValidationError):
+        RouteResponse(
+            start_terminal_id=1,
+            found=False,
+            starting_budget=1000.0,
+            final_cash=1000.0,
+            actual_rank_used=-1,
+        )
 
 
 # --- RefreshStatusOut --------------------------------------------------------
