@@ -14,10 +14,21 @@ backend is running on a different port).
 
 Security note: terminal/commodity/ship names rendered here come from the
 external, crowd-sourced wiki/UEX APIs and must be treated as untrusted
-display text, never markup -- `unsafe_allow_html=True` is never used
-anywhere in this module (CLAUDE.md's standing security ground rules).
-Every value from the backend goes through Streamlit's normal (HTML-escaping)
-text/table rendering.
+display text, never markup -- every value from the backend goes through
+Streamlit's normal (HTML-escaping) text/table rendering, never
+`unsafe_allow_html=True` (CLAUDE.md's standing security ground rules).
+
+Visual redesign (this task): `_inject_theme_css()` below is the one and
+only place in this module that calls `unsafe_allow_html=True`. It injects a
+single, developer-authored `<style>` block (background image + dark scrim +
+"sci-fi HUD" theme) -- a fixed, literal string this module's author wrote,
+never anything derived from a terminal/commodity/ship name or any other
+API response value. That is a fundamentally different, low-risk pattern
+from the one the rule above forbids (rendering *untrusted external data* as
+raw HTML) -- see the comment at `_inject_theme_css()`'s call site for the
+full reasoning, and `tests/unit/test_frontend_app.py`'s
+`test_unsafe_allow_html_call_sites_are_static_literals_only` for the
+regression guard that keeps it that way.
 
 Phase 2 (Task 16): the route form now mirrors the hop-count/cash/cargo
 search model (CLAUDE.md's "Route search problem") -- a ship picked from
@@ -43,8 +54,12 @@ language rather than echoing those raw 1-10 numbers next to the 0-10
 
 from __future__ import annotations
 
+import base64
 import math
 import os
+import threading
+import time
+from pathlib import Path
 
 import httpx
 import streamlit as st
@@ -58,7 +73,332 @@ REFRESH_TIMEOUT_SECONDS = 120.0  # /refresh can take a while: several external A
 #: never collide with live data.
 _ALL_OPTION = "All"
 
+#: Bundled background image + its attribution, kept together so the code
+#: comment and the on-screen credit can never drift apart. See
+#: `_background_image_data_uri()` for the full sourcing/license note.
+_ASSETS_DIR = Path(__file__).resolve().parent / "assets"
+_BACKGROUND_IMAGE_PATH = _ASSETS_DIR / "background.jpg"
+_BACKGROUND_ATTRIBUTION_MARKDOWN = (
+    "Background: *Neptune Wide Field (NIRCam)*, NASA/ESA/CSA/STScI "
+    "(Webb Space Telescope, 2022) -- public domain, "
+    "[source](https://science.nasa.gov/missions/webb/"
+    "new-webb-image-captures-clearest-view-of-neptunes-rings-in-decades/)."
+)
+
 st.set_page_config(page_title="SC Trading Route Optimizer", layout="wide")
+
+
+# --- visual theme: background image + dark "sci-fi HUD" styling ----------------
+#
+# Image sourcing / license (project owner's decision -- see the task brief):
+#   Title:   "Neptune Wide Field (NIRCam)"
+#   Source:  NASA's official James Webb Space Telescope image gallery,
+#            https://science.nasa.gov/missions/webb/
+#            new-webb-image-captures-clearest-view-of-neptunes-rings-in-decades/
+#   Direct asset (as published by NASA):
+#            https://assets.science.nasa.gov/dynamicimage/assets/science/
+#            missions/webb/science/2022/09/STScI-01GCVNZ68YTC7FPTBSNA3QDGYW.png
+#   Credit:  NASA, ESA, CSA, STScI; Image processing: Joseph DePasquale (STScI),
+#            Naomi Rowe-Gurney (NASA-GSFC)
+#   License: U.S. government work -- public domain, unrestricted use. NASA's
+#            media usage guidelines (https://www.nasa.gov/nasa-brand-center/
+#            images-and-media/) ask only that "NASA should be acknowledged as
+#            the source of the material," which is why a visible credit is
+#            also rendered in the sidebar footer by `_render_sidebar()`
+#            (`_BACKGROUND_ATTRIBUTION_MARKDOWN` above), not just recorded
+#            here in a comment.
+#   Not a photo of Star Citizen itself, deliberately -- CIG's fan content
+#   policy doesn't authorize using their marketing material/concept art, so
+#   this avoids that category entirely.
+#
+# Downloaded once (not fetched at runtime -- this app must not depend on an
+# external host being reachable) and re-encoded locally: the original
+# ~26 MB / 4253x4134 PNG was resized to its long edge at 1920px and saved as
+# an ~85%-quality JPEG (`frontend/assets/background.jpg`, ~390 KB, 1920x1866)
+# via Pillow, a dependency already pinned in requirements.txt.
+@st.cache_data
+def _background_image_data_uri() -> str:
+    """Base64 data-URI encoding of the bundled background image.
+
+    Computed once per process, not once per script rerun -- Streamlit
+    reruns this whole module top-to-bottom on every widget interaction --
+    and cached via `@st.cache_data`, the same pattern already used for
+    `_fetch_terminals`/`_fetch_ships` below (just with no TTL: the bundled
+    file never changes while the process is running).
+
+    A data URI (rather than, say, `st.image` or Streamlit's static-file
+    serving) is used so the CSS `background-image` below can reference the
+    photo directly with no extra server route/config needed and no
+    dependency on where the process's current working directory happens to
+    be.
+    """
+    image_bytes = _BACKGROUND_IMAGE_PATH.read_bytes()
+    encoded = base64.b64encode(image_bytes).decode("ascii")
+    return f"data:image/jpeg;base64,{encoded}"
+
+
+def _inject_theme_css() -> None:
+    """Injects one `<style>` block: the fixed-parallax background photo, a
+    dark scrim over it for text legibility, and a cohesive dark "sci-fi HUD"
+    theme (cool cyan accents, a technical/monospace font for headers and
+    widget labels, subtle glow/border styling) for the rest of the UI.
+
+    Parallax effect: pure CSS, scroll-based only -- `background-attachment:
+    fixed` (the image stays fixed in the viewport while foreground content
+    scrolls over it) plus `background-size: cover` / `background-position:
+    center`. Deliberately **not** JS/mouse-tracking-based; that was
+    considered and explicitly ruled out for this app.
+
+    SECURITY NOTE, re: CLAUDE.md's "never use `unsafe_allow_html=True` ...
+    on any data sourced from the external APIs": that rule exists because
+    terminal/commodity/ship names are untrusted, crowd-sourced strings that
+    must never be interpreted as markup. The call below is a different
+    thing entirely -- a single fixed, developer-authored CSS string. The
+    only interpolation anywhere in it is `background_uri`, a base64
+    encoding of *this repo's own bundled asset file*
+    (`frontend/assets/background.jpg`) computed by
+    `_background_image_data_uri()` above -- never a value that traces back
+    to a `/terminals`, `/ships`, or `/route` response. Keep it that way: if
+    a future change to this function ever needs to interpolate anything
+    else in, it must not be request/response data, or this safety argument
+    (and the regression test guarding it,
+    `tests/unit/test_frontend_app.py::
+    test_unsafe_allow_html_call_sites_are_static_literals_only`) no longer
+    holds.
+    """
+    background_uri = _background_image_data_uri()
+    st.markdown(
+        f"""
+        <style>
+        :root {{
+            color-scheme: dark;
+            --sc-panel-bg: rgba(8, 14, 26, 0.72);
+            --sc-panel-border: rgba(56, 242, 255, 0.25);
+            --sc-sidebar-bg: rgba(6, 11, 20, 0.95);
+            --sc-input-bg: rgba(10, 18, 32, 0.85);
+            --sc-accent-cyan: #38f2ff;
+            --sc-accent-amber: #ffb454;
+            --sc-text-primary: #eaf4ff;
+            --sc-text-muted: #a9bdd4;
+            --sc-font-hud: "Consolas", "Cascadia Mono", "SFMono-Regular",
+                "Segoe UI Mono", "Courier New", monospace;
+        }}
+
+        /* Full-page fixed parallax background photo + dark scrim gradient,
+           so text/widgets laid over a busy astronomical photo stay legible
+           (a hard requirement, not polish -- see the module docstring). */
+        [data-testid="stAppViewContainer"] {{
+            background-image:
+                linear-gradient(180deg, rgba(4, 8, 16, 0.88) 0%, rgba(3, 6, 13, 0.94) 100%),
+                url("{background_uri}");
+            background-size: cover;
+            background-position: center center;
+            background-attachment: fixed;
+            background-repeat: no-repeat;
+        }}
+
+        [data-testid="stHeader"] {{
+            background: rgba(0, 0, 0, 0);
+        }}
+
+        [data-testid="stSidebar"] {{
+            background: var(--sc-sidebar-bg);
+            border-right: 1px solid var(--sc-panel-border);
+        }}
+
+        [data-testid="stSidebar"] [data-testid="stMarkdownContainer"],
+        [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p,
+        [data-testid="stSidebar"] [data-testid="stCaptionContainer"],
+        [data-testid="stSidebar"] [data-testid="stWidgetLabel"] p {{
+            color: var(--sc-text-primary);
+        }}
+
+        /* Main content sits on a translucent dark "HUD panel" over the photo. */
+        [data-testid="stMain"] .block-container {{
+            background: var(--sc-panel-bg);
+            border: 1px solid var(--sc-panel-border);
+            border-radius: 16px;
+            padding: 2rem 2.5rem 3rem;
+            box-shadow: 0 0 48px rgba(0, 0, 0, 0.5);
+        }}
+
+        [data-testid="stAppViewContainer"] [data-testid="stMarkdownContainer"] p,
+        [data-testid="stAppViewContainer"] [data-testid="stMarkdownContainer"] li,
+        [data-testid="stAppViewContainer"] [data-testid="stCaptionContainer"],
+        [data-testid="stWidgetLabel"] p {{
+            color: var(--sc-text-primary);
+        }}
+
+        h1, h2, h3 {{
+            font-family: var(--sc-font-hud);
+            letter-spacing: 0.03em;
+            /* `!important`: Streamlit's own Emotion-generated, class-scoped
+               heading rule (e.g. `.st-emotion-cache-xxxx h1`) outranks a
+               plain `h1` selector on specificity alone, so a bare
+               `color:`/`text-shadow:` here is silently dropped rather than
+               applied -- confirmed visually (headers rendered in
+               Streamlit's default muted grey, not this accent color, until
+               `!important` was added). */
+            color: var(--sc-accent-cyan) !important;
+            text-shadow: 0 0 16px rgba(56, 242, 255, 0.3);
+        }}
+
+        [data-testid="stWidgetLabel"] p {{
+            font-family: var(--sc-font-hud);
+            letter-spacing: 0.02em;
+            color: var(--sc-text-muted);
+        }}
+
+        /* Buttons */
+        .stButton > button {{
+            background: linear-gradient(180deg, rgba(31, 184, 201, 0.22), rgba(15, 30, 48, 0.85));
+            border: 1px solid var(--sc-accent-cyan);
+            color: var(--sc-text-primary);
+            font-family: var(--sc-font-hud);
+            letter-spacing: 0.04em;
+            border-radius: 6px;
+            transition: box-shadow 0.15s ease, background 0.15s ease;
+        }}
+        .stButton > button:hover {{
+            background: linear-gradient(180deg, rgba(56, 242, 255, 0.32), rgba(15, 30, 48, 0.9));
+            box-shadow: 0 0 18px rgba(56, 242, 255, 0.45);
+            color: var(--sc-accent-cyan);
+        }}
+
+        /* Text/number inputs and selectboxes (BaseWeb components) */
+        input, textarea {{
+            background-color: var(--sc-input-bg) !important;
+            color: var(--sc-text-primary) !important;
+            border-color: var(--sc-panel-border) !important;
+        }}
+        [data-baseweb="select"] > div {{
+            background-color: var(--sc-input-bg) !important;
+            border-color: var(--sc-panel-border) !important;
+        }}
+        /* Selectbox dropdown popover (rendered in a portal, outside the
+           `.stApp` tree -- verified against the real rendered DOM via a
+           headless-browser QA pass, since Streamlit's current selectbox
+           implementation uses react-aria `role="listbox"`/`role="option"`
+           markup, not the older BaseWeb menu markup an earlier draft of
+           this rule assumed and which silently matched nothing). */
+        [role="listbox"] {{
+            background-color: #0d1626 !important;
+            border: 1px solid var(--sc-panel-border) !important;
+        }}
+        [role="listbox"] [role="option"] {{
+            background-color: #0d1626 !important;
+            color: var(--sc-text-primary) !important;
+        }}
+        [role="listbox"] [role="option"][aria-selected="true"] {{
+            background-color: rgba(56, 242, 255, 0.18) !important;
+        }}
+
+        /* Checkbox check-icon box (the div immediately holding the check
+           SVG -- structural position, not an auto-generated Emotion class
+           name, which Streamlit doesn't treat as stable/public API). */
+        [data-testid="stCheckbox"] label > div:first-of-type {{
+            border-color: var(--sc-accent-cyan) !important;
+        }}
+
+        /* NOTE, deliberately NOT overridden: the slider fill/thumb still
+           render in Streamlit's own default accent color. Its DOM (checked
+           against the real rendered page) has no `data-testid`/stable
+           attribute on the filled-track or thumb elements -- only
+           auto-generated Emotion classes Streamlit does not treat as
+           public API and which can change across versions. Chasing that
+           with brittle positional selectors would risk exactly the
+           "fighting Streamlit's CSS too aggressively" failure mode this
+           task explicitly warns against, for a purely cosmetic mismatch
+           that doesn't affect legibility -- the slider's value bubble and
+           track remain fully legible either way. */
+
+        /* Results table + progress bar accents */
+        [data-testid="stDataFrame"] {{
+            border: 1px solid var(--sc-panel-border);
+            border-radius: 10px;
+            overflow: hidden;
+        }}
+        [data-testid="stProgress"] div[role="progressbar"] > div {{
+            background-image: linear-gradient(90deg, var(--sc-accent-cyan), var(--sc-accent-amber));
+        }}
+
+        ::-webkit-scrollbar {{ width: 10px; height: 10px; }}
+        ::-webkit-scrollbar-thumb {{ background: rgba(56, 242, 255, 0.35); border-radius: 6px; }}
+        ::-webkit-scrollbar-track {{ background: rgba(4, 8, 16, 0.6); }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+# --- simulated progress bar (Streamlit has no native "update a bar while a --
+# --- blocking call runs" primitive -- see `_run_with_simulated_progress`) ------
+
+
+def _run_with_simulated_progress(work_fn, *, label: str, estimated_seconds: float):
+    """Runs the zero-arg blocking callable `work_fn` (a real backend HTTP
+    call) while animating an `st.progress` bar, and returns whatever
+    `work_fn` returns (re-raising whatever it raises).
+
+    **Why this approach, not a plain `st.spinner`:** Streamlit reruns this
+    whole script top-to-bottom on every interaction and has no built-in way
+    to update a widget *while* a single blocking statement is executing --
+    a bar can only visibly move between statements the script itself
+    executes, one at a time, in order. Since neither `/route` nor `/refresh`
+    streams real progress (each is one atomic request/response -- see the
+    task brief), "smooth" here has to mean a *simulated* animation that
+    keeps advancing while the real call is still in flight, landing at/near
+    100% only once the real response actually arrives.
+
+    **How:** the real HTTP call runs on a background `threading.Thread`
+    that touches no `st.*` API at all (calling Streamlit APIs off the main
+    script thread is unsupported -- it either no-ops or logs a "missing
+    ScriptRunContext" warning, since Streamlit's rendering context is
+    thread-local to the script's main thread). The main thread -- which
+    *does* own the script's rendering context -- creates the progress bar
+    once, then polls the worker thread in a short sleep loop, nudging that
+    *same* bar element on every tick. Calling `.progress()` again on an
+    already-created element updates it in place over the live connection;
+    this deliberately never calls `st.rerun()`, which would restart the
+    whole script from the top and lose the in-flight request/thread
+    entirely -- reruns are the wrong tool here, not a variant worth using.
+
+    **Why it can't stall or look broken either way:** the animated value is
+    an asymptotic approach toward 90% (`1 - exp(-elapsed / estimated_seconds)`),
+    so it keeps visibly creeping forward the whole time the call is
+    outstanding but can never itself claim "done" before the real response
+    exists -- correct whether the call finishes in 200ms or 20s. Once
+    `work_fn` actually returns (or raises), the bar is snapped straight to
+    100% and held just long enough to register, then cleared.
+    """
+    progress_bar = st.progress(0, text=label)
+    result_holder: dict = {}
+
+    def _target() -> None:
+        try:
+            result_holder["result"] = work_fn()
+        except Exception as exc:  # re-raised on the main thread below
+            result_holder["error"] = exc
+
+    worker = threading.Thread(target=_target, daemon=True)
+    start = time.monotonic()
+    worker.start()
+
+    tick_seconds = 0.05
+    while worker.is_alive():
+        time.sleep(tick_seconds)
+        elapsed = time.monotonic() - start
+        fraction = 1.0 - math.exp(-elapsed / estimated_seconds)
+        progress_bar.progress(min(90, int(fraction * 90)), text=label)
+
+    worker.join()
+    progress_bar.progress(100, text=label)
+    time.sleep(0.15)  # let the 100% state register before it disappears
+    progress_bar.empty()
+
+    if "error" in result_holder:
+        raise result_holder["error"]
+    return result_holder["result"]
 
 
 # --- backend calls -------------------------------------------------------------
@@ -141,29 +481,48 @@ def _render_sidebar() -> None:
     refresh_token = st.sidebar.text_input("Refresh token (if configured)", type="password")
     if st.sidebar.button("Refresh data now"):
         with st.sidebar:
-            with st.spinner("Refreshing... this can take a little while."):
-                try:
-                    response = _trigger_refresh(refresh_token or None)
-                except httpx.HTTPError:
-                    st.error(f"Could not reach the backend at {BACKEND_BASE_URL}.")
+            try:
+                response = _run_with_simulated_progress(
+                    lambda: _trigger_refresh(refresh_token or None),
+                    label="Refreshing...",
+                    # A real refresh hits several external APIs and can
+                    # legitimately take a while (REFRESH_TIMEOUT_SECONDS
+                    # allows up to 120s) -- a longer estimate keeps the
+                    # simulated animation's approach-to-90% pace realistic
+                    # instead of parking early and sitting still for most
+                    # of a real refresh.
+                    estimated_seconds=20.0,
+                )
+            except httpx.HTTPError:
+                st.error(f"Could not reach the backend at {BACKEND_BASE_URL}.")
+            else:
+                if response.status_code == 401:
+                    st.error("Refresh rejected: missing or invalid token.")
+                elif response.status_code == 409:
+                    st.error("A refresh is already in progress.")
+                elif response.status_code == 429:
+                    st.error("Too many refresh requests -- please wait a moment and try again.")
+                elif response.status_code != 200:
+                    st.error(f"Refresh failed (HTTP {response.status_code}).")
                 else:
-                    if response.status_code == 401:
-                        st.error("Refresh rejected: missing or invalid token.")
-                    elif response.status_code == 409:
-                        st.error("A refresh is already in progress.")
-                    elif response.status_code == 429:
-                        st.error("Too many refresh requests -- please wait a moment and try again.")
-                    elif response.status_code != 200:
-                        st.error(f"Refresh failed (HTTP {response.status_code}).")
+                    body = response.json()
+                    if body["status"] == "success":
+                        st.success("Refresh complete.")
                     else:
-                        body = response.json()
-                        if body["status"] == "success":
-                            st.success("Refresh complete.")
-                        else:
-                            st.error(f"Refresh failed: {body.get('error_message') or 'unknown error'}")
-                        _fetch_terminals.clear()
-                        _fetch_ships.clear()
-                        st.rerun()
+                        st.error(f"Refresh failed: {body.get('error_message') or 'unknown error'}")
+                    _fetch_terminals.clear()
+                    _fetch_ships.clear()
+                    st.rerun()
+
+    st.sidebar.divider()
+    # Visible attribution credit for the bundled background image, per its
+    # license terms -- see the code comment at `_inject_theme_css()` for the
+    # full source/license record this caption is required to match. Plain
+    # `st.sidebar.caption` markdown, not `unsafe_allow_html` -- a hardcoded
+    # literal constant, not API-sourced text, but there's no HTML/markup
+    # need here at all, so the safer default (Streamlit's own escaping)
+    # applies same as everywhere else in this module.
+    st.sidebar.caption(_BACKGROUND_ATTRIBUTION_MARKDOWN)
 
 
 # --- starting-terminal filtering (System -> Planetoid -> orbital stations) -----
@@ -531,18 +890,22 @@ def _render_route_search(terminals: list[dict], ships: list[dict]) -> None:
         )
 
     if st.button("Find best route", type="primary"):
-        with st.spinner("Searching..."):
-            try:
-                response = _search_route(
+        try:
+            response = _run_with_simulated_progress(
+                lambda: _search_route(
                     start_terminal_id, ship_id, num_hops, starting_budget, risk_level
-                )
-            except httpx.HTTPError:
-                st.error(f"Could not reach the backend at {BACKEND_BASE_URL}.")
-                return
+                ),
+                label="Searching for the best route...",
+                estimated_seconds=2.5,
+            )
+        except httpx.HTTPError:
+            st.error(f"Could not reach the backend at {BACKEND_BASE_URL}.")
+            return
         _render_route_results(response, terminal_names[start_terminal_id])
 
 
 def main() -> None:
+    _inject_theme_css()
     st.title("Star Citizen Trading Route Optimizer")
     _render_sidebar()
 

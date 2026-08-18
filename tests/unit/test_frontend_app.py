@@ -11,10 +11,20 @@ not a full behavioral spec of every widget interaction.
 Phase 2 (Task 16): `main()` now always fetches both `/terminals` and
 `/ships` (the route form needs a ship selection), so every test below
 mocks both endpoints even when a test cares only about one of them.
+
+Visual redesign (background image + "sci-fi HUD" theme + simulated progress
+bars): the functional tests above/below are unchanged in intent -- the
+redesign changed only how things look, not what they do, so every existing
+assertion here doubles as a regression check that restyling didn't break
+real behavior. Two new sections cover what's actually new: the theme CSS
+injection itself (`_inject_theme_css`) and a static-analysis regression
+guard on every `unsafe_allow_html=True` call site in `frontend/app.py`,
+directly enforcing the security reasoning in that module's docstring.
 """
 
 from __future__ import annotations
 
+import ast
 import json
 import math
 from pathlib import Path
@@ -821,3 +831,208 @@ def test_app_shows_not_found_message():
 
     assert not at.exception
     assert any("No profitable route found" in info.value for info in at.info)
+
+
+# --- visual theme: background image + "sci-fi HUD" styling -----------------------
+
+
+@respx.mock
+def test_theme_css_is_injected_with_background_and_hud_styling():
+    """`_inject_theme_css()` must actually run and inject its `<style>`
+    block -- checked via `AppTest`'s exposed `Markdown` elements (Streamlit
+    represents both `st.markdown` and the `st.write(str)` calls elsewhere in
+    this module as `Markdown` elements; `proto.allow_html` is what
+    distinguishes an `unsafe_allow_html=True` call from a normal one).
+
+    Spot-checks a handful of the concrete style facts the task brief hard-
+    requires -- the CSS-only fixed-parallax background wiring
+    (`background-attachment: fixed`, `background-size: cover`) and that the
+    bundled image is actually embedded (a `data:image/jpeg;base64,` URI, not
+    a remote link) -- rather than the full stylesheet text, so this doesn't
+    become unmaintainable as the theme is tuned further.
+    """
+    _mock_status_terminals_ships(terminals=_terminals_payload(), ships=_ships_payload())
+
+    at = AppTest.from_file(APP_PATH)
+    at.run()
+
+    assert not at.exception
+    html_markdown = [m for m in at.markdown if m.proto.allow_html]
+    assert len(html_markdown) == 1, (
+        f"expected exactly one unsafe_allow_html=True markdown element, found {len(html_markdown)}"
+    )
+    css = html_markdown[0].value
+    assert "<style>" in css
+    # Scroll-based, CSS-only parallax -- no JS anywhere (explicitly ruled out).
+    assert "background-attachment: fixed" in css
+    assert "background-size: cover" in css
+    assert "background-position: center center" in css
+    assert "<script" not in css.lower()
+    # The image is bundled/embedded, never a remote hotlink at runtime.
+    assert "data:image/jpeg;base64," in css
+    assert "http://" not in css and "https://" not in css
+    # A dark scrim sits between the photo and foreground content/text.
+    assert "linear-gradient" in css
+
+
+@respx.mock
+def test_background_attribution_caption_rendered_in_sidebar():
+    """A visible, unobtrusive credit for the bundled background image must
+    appear in the sidebar footer, naming NASA/the license -- a real
+    licensing condition (see `frontend/app.py`'s comment at
+    `_inject_theme_css()`), not optional polish."""
+    _mock_status_terminals_ships(terminals=_terminals_payload(), ships=_ships_payload())
+
+    at = AppTest.from_file(APP_PATH)
+    at.run()
+
+    assert not at.exception
+    sidebar_captions = [c.value for c in at.sidebar.caption]
+    assert any("NASA" in value and "public domain" in value for value in sidebar_captions)
+
+
+def test_background_asset_bundled_locally_and_reasonably_sized():
+    """The background image must be a real, downloaded file checked into
+    the repo -- not a placeholder and not fetched from a remote host at
+    runtime (`_inject_theme_css()` reads it via `_BACKGROUND_IMAGE_PATH`
+    and embeds it as a data URI, never a network call)."""
+    background_path = Path(APP_PATH).resolve().parent / "assets" / "background.jpg"
+    assert background_path.is_file(), f"missing bundled background image: {background_path}"
+
+    size_bytes = background_path.stat().st_size
+    # A placeholder/broken download would be near-empty; an unresized
+    # straight-from-the-source-archive file would be tens of MB (this task's
+    # brief asks for compression to roughly 1-2 MB or less). Generous
+    # bounds, not an exact pin -- this just catches "someone swapped in a
+    # 1x1 placeholder" or "someone bundled the raw, uncompressed original."
+    assert 20_000 < size_bytes < 3_000_000, f"unexpected background.jpg size: {size_bytes} bytes"
+
+    # A real JPEG file signature (FF D8 FF), not some other/corrupt format.
+    with open(background_path, "rb") as f:
+        header = f.read(3)
+    assert header == b"\xff\xd8\xff", "background.jpg does not look like a real JPEG file"
+
+
+# --- unsafe_allow_html regression guard (static analysis) ------------------------
+
+
+def _unsafe_allow_html_true_calls(tree: ast.Module) -> list[ast.Call]:
+    """Every `ast.Call` node anywhere in `tree` that passes
+    `unsafe_allow_html=True` as a keyword argument."""
+    calls = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        for kw in node.keywords:
+            if (
+                kw.arg == "unsafe_allow_html"
+                and isinstance(kw.value, ast.Constant)
+                and kw.value.value is True
+            ):
+                calls.append(node)
+                break
+    return calls
+
+
+def _content_arg(call: ast.Call) -> ast.expr:
+    """The "body" argument of an `st.markdown(...)`-shaped call -- the first
+    positional argument, or the `body=`/`value=` keyword if passed that way.
+    """
+    if call.args:
+        return call.args[0]
+    for kw in call.keywords:
+        if kw.arg in ("body", "value"):
+            return kw.value
+    raise AssertionError(f"could not find the content argument on {ast.dump(call)}")
+
+
+def _names_referenced_in_fstring(node: ast.JoinedStr) -> set[str]:
+    """Every bare identifier referenced inside any `{...}` interpolation of
+    an f-string -- e.g. `f"a{b}{c.d}"` -> `{"b", "c"}`. Used to check *what*
+    is being interpolated, not just *that* something is."""
+    names: set[str] = set()
+    for value in node.values:
+        if isinstance(value, ast.FormattedValue):
+            for sub in ast.walk(value.value):
+                if isinstance(sub, ast.Name):
+                    names.add(sub.id)
+    return names
+
+
+def test_unsafe_allow_html_call_sites_are_static_literals_only():
+    """Regression guard for the security reasoning in `frontend/app.py`'s
+    module docstring and `_inject_theme_css()`'s comment: every
+    `unsafe_allow_html=True` call in this module must be a fixed,
+    developer-authored string -- a plain literal, or an f-string that only
+    ever interpolates `background_uri` (this repo's own bundled asset,
+    base64-encoded -- never anything that traces back to a `/terminals`,
+    `/ships`, or `/route` response).
+
+    This is a static-analysis check on the source, deliberately not a
+    runtime/`AppTest` check: the goal is to catch a *future* change that
+    starts interpolating request/response data into one of these calls --
+    e.g. a well-meaning "show the selected ship's name in a styled badge"
+    change that writes `f"<div>{ship_name}</div>"` into this call. That
+    would still "work" and might even look fine in a single test run, which
+    is exactly why a runtime check isn't sufficient here; this test fails
+    the moment any name outside the allowlist appears inside an
+    `unsafe_allow_html=True` call's content, regardless of what value it
+    happens to hold when the test runs.
+    """
+    source = Path(APP_PATH).read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=APP_PATH)
+
+    calls = _unsafe_allow_html_true_calls(tree)
+    # Exact call-site count, per the task brief -- today there is exactly
+    # one (`_inject_theme_css`'s `st.markdown(...)`). A second call site
+    # appearing is not automatically wrong, but it must be deliberate and
+    # reviewed, not an accidental byproduct of some other change -- bumping
+    # this number is the explicit signal that review needs to happen.
+    assert len(calls) == 1, (
+        f"expected exactly 1 unsafe_allow_html=True call site in {APP_PATH}, "
+        f"found {len(calls)} at lines {[c.lineno for c in calls]}. If this "
+        "growth is intentional, re-verify each new call site only ever "
+        "renders a static, developer-authored literal (see the module "
+        "docstring's security note) before updating this test."
+    )
+
+    # That one call site must live inside `_inject_theme_css`, not somewhere
+    # else -- confirms *where* the reviewed exception applies.
+    theme_fn = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_inject_theme_css"
+    )
+    assert calls[0] in list(ast.walk(theme_fn)), (
+        "the sole unsafe_allow_html=True call site must be inside "
+        "_inject_theme_css(), not elsewhere in the module"
+    )
+
+    allowed_names = {"background_uri"}
+    for call in calls:
+        content = _content_arg(call)
+        if isinstance(content, ast.Constant) and isinstance(content.value, str):
+            continue  # a pure literal is always safe
+        if isinstance(content, ast.JoinedStr):
+            referenced = _names_referenced_in_fstring(content)
+            disallowed = referenced - allowed_names
+            assert not disallowed, (
+                f"unsafe_allow_html=True call at line {call.lineno} interpolates "
+                f"{sorted(disallowed)!r} into its content -- only {allowed_names!r} "
+                "(this repo's own bundled background-image data URI) may ever be "
+                "interpolated into an unsafe_allow_html=True call. If this is "
+                "genuinely safe, non-API-sourced data, add it to `allowed_names` "
+                "in this test with a comment explaining why; if it traces back to "
+                "a /terminals, /ships, or /route response, it must not be here at all."
+            )
+            continue
+        # Anything else (a `.format()` call, string concatenation via `+`,
+        # etc.) is exactly the kind of construct that could smuggle dynamic
+        # content in without a human noticing -- fail loudly rather than
+        # try to enumerate every unsafe shape.
+        raise AssertionError(
+            f"unsafe_allow_html=True call at line {call.lineno} has a content "
+            f"argument that is neither a plain string literal nor a simple "
+            f"f-string ({ast.dump(content)}) -- this needs manual review, not "
+            "an automatic pass."
+        )
