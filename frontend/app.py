@@ -29,6 +29,16 @@ stations" (derived client-side from the same `GET /terminals` response
 already fetched -- CLAUDE.md's Task 12 addendum documents the underlying
 `planet_name`/`moon_name`/`is_orbital_station` fields) before being handed
 to a searchable `st.selectbox`.
+
+Phase 3 (Task 22): a "Risk / reward" slider (0-10, default 10) sends
+`RouteRequest.risk_level` alongside the existing route parameters --
+`backend/routers/route.py` maps it server-side to the search algorithm's
+1-10 `rank` (`rank = max(1, 10 - risk_level)`); this module never computes
+`rank` itself. The results area surfaces `RouteResponse.requested_rank`/
+`actual_rank_used` back to the user in plain "Nth-most-profitable route"
+language rather than echoing those raw 1-10 numbers next to the 0-10
+`risk_level` scale the user actually set (the two scales don't line up
+1:1, so showing both risks a confusing mismatch -- see `_ordinal`).
 """
 
 from __future__ import annotations
@@ -85,13 +95,18 @@ def _trigger_refresh(token: str | None) -> httpx.Response:
 
 
 def _search_route(
-    start_terminal_id: int, ship_id: int, num_hops: int, starting_budget: float
+    start_terminal_id: int,
+    ship_id: int,
+    num_hops: int,
+    starting_budget: float,
+    risk_level: int,
 ) -> httpx.Response:
     payload = {
         "start_terminal_id": start_terminal_id,
         "ship_id": ship_id,
         "num_hops": num_hops,
         "starting_budget": starting_budget,
+        "risk_level": risk_level,
     }
     # Not `raise_for_status()`-ed here: 404/422 carry a `detail` message this
     # UI wants to show the user, not just discard as a generic error.
@@ -221,6 +236,60 @@ def _filter_terminals(
 # --- main: route search ----------------------------------------------------------
 
 
+def _ordinal(n: int) -> str:
+    """English ordinal string for a positive integer, e.g. `3` -> `"3rd"`.
+
+    Used only to phrase the profitability-rank transparency message below
+    in "the Nth-most-profitable route" terms -- deliberately *not* the same
+    presentation as the 0-10 `risk_level` slider value, since
+    `RouteResponse.requested_rank`/`actual_rank_used` live on a different
+    1-10 scale (`backend/routers/route.py`: `rank = max(1, 10 -
+    risk_level)`) that doesn't line up 1:1 with `risk_level` (e.g.
+    `risk_level` 9 and 10 both resolve to `rank=1`). Echoing the raw rank
+    number next to a slider the user thinks of in `risk_level` terms would
+    invite exactly that confusion, so this only ever surfaces the rank as a
+    plain ordinal describing route order, never alongside a `risk_level`
+    number.
+    """
+    if 10 <= (n % 100) <= 20:
+        suffix = "th"
+    else:
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suffix}"
+
+
+def _render_rank_transparency(body: dict) -> None:
+    """Surfaces `RouteResponse.requested_rank`/`actual_rank_used` (Phase 3)
+    so a user who lowered the risk/reward slider -- deliberately asking for
+    a route other than the single best one -- can tell whether they got
+    what they asked for.
+
+    Stays silent for the common/default case (`requested_rank == 1`, i.e.
+    the risk/reward slider left at its default `10`) to match this app's
+    plain, uncluttered tone -- there's nothing to reconcile when the user
+    never asked for anything but the best route. `actual_rank_used !=
+    requested_rank` means `find_best_route` had to clamp down to the
+    least-profitable route it *did* find (CLAUDE.md's Phase 3 clamp
+    behavior) because fewer than `requested_rank` distinct profitable
+    routes existed -- that always gets an explicit warning, never a
+    silently-substituted rank.
+    """
+    requested_rank = body.get("requested_rank", 1)
+    actual_rank_used = body.get("actual_rank_used", 1)
+
+    if actual_rank_used != requested_rank:
+        route_word = "route" if actual_rank_used == 1 else "routes"
+        verb = "was" if actual_rank_used == 1 else "were"
+        st.warning(
+            f"Only {actual_rank_used} distinct profitable {route_word} {verb} found; "
+            "showing the least profitable one found."
+        )
+    elif requested_rank != 1:
+        st.caption(
+            f"Showing the {_ordinal(requested_rank)}-most-profitable route found, as requested."
+        )
+
+
 def _stop_rows(body: dict, start_terminal_name: str) -> list[dict]:
     """One row per terminal *stop* along the route (the start, plus each
     hop's destination) rather than one row per hop.
@@ -347,6 +416,7 @@ def _render_route_results(response: httpx.Response, start_terminal_name: str) ->
         f"{body['total_distance']:,.1f} distance travelled "
         f"({len(body['hops'])} hop{'s' if len(body['hops']) != 1 else ''})"
     )
+    _render_rank_transparency(body)
 
     rows = _stop_rows(body, start_terminal_name)
 
@@ -440,18 +510,32 @@ def _render_route_search(terminals: list[dict], ships: list[dict]) -> None:
         filter_mode="contains",
     )
 
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
     with col1:
         num_hops = st.number_input("Number of hops", min_value=1, value=5, step=1)
     with col2:
         starting_budget = st.number_input(
             "Starting budget (aUEC)", min_value=0.0, value=50_000.0, step=1000.0
         )
+    with col3:
+        risk_level = st.slider(
+            "Risk / reward",
+            min_value=0,
+            max_value=10,
+            value=10,
+            help=(
+                "10 = the single most profitable route found. Lower values trade "
+                "some profit for a route that's presumably less likely to already "
+                "be picked over by other players."
+            ),
+        )
 
     if st.button("Find best route", type="primary"):
         with st.spinner("Searching..."):
             try:
-                response = _search_route(start_terminal_id, ship_id, num_hops, starting_budget)
+                response = _search_route(
+                    start_terminal_id, ship_id, num_hops, starting_budget, risk_level
+                )
             except httpx.HTTPError:
                 st.error(f"Could not reach the backend at {BACKEND_BASE_URL}.")
                 return

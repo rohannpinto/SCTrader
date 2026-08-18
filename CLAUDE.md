@@ -178,6 +178,67 @@ exists as a concept anywhere in this app.
   (`cash == starting_budget`), which is not strictly greater than
   `starting_budget`, so `found=False`.
 
+**Phase 3 (Tasks 19–22): top-K route ranking, additive on top of everything
+above — the `rank=1` single-best-route algorithm described above is
+unchanged byte-for-byte and stays the default path.** `backend/graph/
+search.py`'s `find_best_route()` gained a 1-indexed `rank: int = 1`
+parameter so a caller can ask for the `rank`-th-best *distinct* route by
+final cash, not only the single best one — the point being a route further
+down the profitability list is presumably less likely to already be picked
+over by other players.
+
+- **Correctness argument is a direct generalization of the existing
+  monotonicity proof, one level up — not a new heuristic.** For `rank > 1`
+  the DP (`_find_top_k_routes`) keeps the top-`rank` labels per
+  `(node, hop)`, sorted descending by cash, instead of just the single best
+  one. Because more cash at a fixed `(node, hops_used)` state always
+  weakly dominates less cash under *any* identical future extension (the
+  same proof already established above — `quantity` is monotonically
+  non-decreasing in `cash`, capped by the same fixed
+  `ship_cargo_capacity_scu` regardless of which label is being extended), a
+  label that falls outside the top-`rank` retained at some state can never
+  itself go on to produce a route among the true global top-`rank`: each of
+  the `rank` labels ranked above it, extended by that same edge sequence,
+  ends up with cash at least as high. `rank <= 1` still dispatches to the
+  original, untouched single-best-label DP (`_find_single_best_route`) —
+  Phase 3 adds zero overhead and zero behavior change for `rank=1`.
+- **`requested_rank`/`actual_rank_used`, both 1-indexed, carried on both
+  `RouteSearchResult` (`backend/graph/search.py`) and `RouteResponse`
+  (`backend/models/schemas.py`):** `requested_rank` is simply the `rank`
+  the search was actually called with. `actual_rank_used` is the position,
+  within the sorted-by-cash-descending pool of every genuinely profitable
+  (`cash > starting_budget`) label found across the whole DP, of the route
+  actually returned — equal to `requested_rank` whenever at least that many
+  distinct profitable routes existed, and clamped *down* to the least-
+  profitable route that *was* found otherwise (a too-high requested rank
+  never turns a genuinely profitable-but-lower-ranked route into
+  `found=False`, as long as at least one profitable route exists at all).
+  `actual_rank_used == 0` iff `found=False` — no route was returned to
+  attach a rank to.
+- **`risk_level` (0–10, user-facing) → `rank` (1–10, internal) mapping
+  lives in `backend/routers/route.py` (`_rank_from_risk_level`), not in the
+  search layer itself** — the search layer only ever knows about `rank`,
+  never `risk_level`: `rank = max(1, 10 - risk_level)`. `risk_level=10`
+  (`RouteRequest`'s default, preserving pre-Phase-3 behavior for any caller
+  that omits the field) → `rank=1`, today's single best route. `risk_level
+  =0` → `rank=10`, the 10th-best distinct profitable route found (clamped
+  per the paragraph above if fewer than 10 exist). The two scales are
+  **not** 1:1 invertible at the top end — `risk_level` 9 and 10 both map to
+  `rank=1` — which is why `frontend/app.py` (Task 22) never echoes the raw
+  `rank`/`requested_rank` number next to the `risk_level` slider value it
+  collected; it phrases rank transparency in plain "Nth-most-profitable
+  route found" language instead, and only when it's actually informative
+  (silent for the common `requested_rank == 1` case, an explicit
+  `st.warning` when `actual_rank_used != requested_rank` names the clamp
+  outright rather than silently substituting a rank the user didn't ask
+  for). `ship_jump_range_gm`/`ship_cargo_capacity_scu`-style "not part of
+  the cache key because it's a deterministic function of something else
+  that already is" reasoning does **not** apply to `rank` itself — it *is*
+  an explicit `/route` cache-key component (see "Two-tier caching
+  architecture" below), since two requests differing only in `risk_level`
+  resolve to different `rank`s and therefore genuinely different correct
+  answers.
+
 ## Two-tier caching architecture
 
 1. **Disk tier (source of truth):** SQLite cache DB (`data/cache.db`, WAL
@@ -206,7 +267,29 @@ exists as a concept anywhere in this app.
      starting_budget, cache_data_version)`, per Task 15's schema/router
      rework), so repeated/lightly-tweaked queries against the same
      refreshed dataset return instantly. The data-version component makes
-     it self-invalidating on every refresh.
+     it self-invalidating on every refresh. Phase 3 (Task 21) adds `rank`
+     as a further key component — see the "Route search problem" section's
+     `risk_level` → `rank` paragraph above for why it must be part of the
+     key, not just an internal computation input.
+
+### Operational: auto-refresh (Phase 3, Task 19)
+
+Data no longer goes stale purely by waiting for someone to click "Refresh
+data now": `backend/main.py`'s `lifespan` starts a daemon
+`threading.Thread` at backend startup (`_auto_refresh_loop`) that
+periodically calls the same `run_refresh_cycle()`
+(`backend/routers/refresh.py`) a manual `POST /refresh` uses. **Enabled by
+default** (`settings.auto_refresh_enabled = True`), firing every **60
+minutes by default** (`settings.auto_refresh_interval_minutes`), both
+configurable via the `AUTO_REFRESH_ENABLED`/`AUTO_REFRESH_INTERVAL_MINUTES`
+environment variables (or `.env`). It shares the exact same in-process
+refresh-overlap lock a manual `/refresh` request goes through — an
+automatic tick that lands while a manual refresh (or another tick) is
+already in flight simply loses the race and is skipped, never double-hits
+the external APIs or races cache writes, no separate scheduler-specific
+locking needed. The thread is a daemon and is signaled to stop (not just
+abandoned) during `lifespan` shutdown, so it never outlives the app
+process or leaves a stray background thread after a clean shutdown.
 
 ## Project structure
 

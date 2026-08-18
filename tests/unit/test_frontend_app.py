@@ -15,6 +15,7 @@ mocks both endpoints even when a test cares only about one of them.
 
 from __future__ import annotations
 
+import json
 import math
 from pathlib import Path
 
@@ -66,6 +67,12 @@ def _find_number_input(at: AppTest, label: str):
 def _find_checkbox(at: AppTest, label: str):
     matches = [box for box in at.checkbox if box.label == label]
     assert len(matches) == 1, f"expected exactly one {label!r} checkbox, found {len(matches)}"
+    return matches[0]
+
+
+def _find_slider(at: AppTest, label: str):
+    matches = [slider for slider in at.slider if slider.label == label]
+    assert len(matches) == 1, f"expected exactly one {label!r} slider, found {len(matches)}"
     return matches[0]
 
 
@@ -270,6 +277,76 @@ def test_hops_input_is_integer_and_budget_input_is_float():
     assert isinstance(budget_box.value, float)
 
 
+# --- risk/reward slider (Phase 3, Task 22) ----------------------------------------
+
+
+def _minimal_found_route_response_json(**rank_kwargs) -> dict:
+    """A single-hop, `found=True` route response -- just enough shape for
+    the tests below, which care about the request payload / rank-
+    transparency messaging, not the per-stop table itself (already covered
+    exhaustively in the "route search results" section further down)."""
+    hops = [
+        {
+            "terminal_id": 2,
+            "terminal_name": "Everus Harbor",
+            "commodity_id": 1,
+            "commodity_name": "Laranite",
+            "distance_from_previous": 10.0,
+            "quantity_traded": 20.0,
+            "unit_buy_price": 3.5,
+            "unit_sell_price": 5.0,
+            "profit_this_hop": 30.0,
+        },
+    ]
+    return _route_response_json(
+        hops=hops,
+        starting_budget=100.0,
+        final_cash=130.0,
+        total_profit=30.0,
+        total_distance=10.0,
+        **rank_kwargs,
+    )
+
+
+@respx.mock
+def test_risk_level_slider_defaults_to_10_and_sends_it_untouched():
+    _mock_status_terminals_ships(terminals=_terminals_payload(), ships=_ships_payload())
+    route = respx.post(f"{BACKEND_BASE_URL}/route").mock(
+        return_value=httpx.Response(200, json=_minimal_found_route_response_json())
+    )
+
+    at = AppTest.from_file(APP_PATH)
+    at.run()
+
+    slider = _find_slider(at, "Risk / reward")
+    assert slider.min == 0
+    assert slider.max == 10
+    assert slider.value == 10  # default preserves pre-Phase-3 behavior
+
+    _find_button(at, "Find best route").click().run(timeout=15)
+    assert not at.exception
+
+    sent_payload = json.loads(route.calls.last.request.content)
+    assert sent_payload["risk_level"] == 10
+
+
+@respx.mock
+def test_risk_level_slider_moved_value_is_sent_in_request():
+    _mock_status_terminals_ships(terminals=_terminals_payload(), ships=_ships_payload())
+    route = respx.post(f"{BACKEND_BASE_URL}/route").mock(
+        return_value=httpx.Response(200, json=_minimal_found_route_response_json())
+    )
+
+    at = AppTest.from_file(APP_PATH)
+    at.run()
+    _find_slider(at, "Risk / reward").set_value(3).run()
+    _find_button(at, "Find best route").click().run(timeout=15)
+    assert not at.exception
+
+    sent_payload = json.loads(route.calls.last.request.content)
+    assert sent_payload["risk_level"] == 3
+
+
 # --- System / Planetoid / orbital-station filtering (Task 16) --------------------
 
 
@@ -420,6 +497,8 @@ def _route_response_json(
     final_cash: float,
     total_profit: float,
     total_distance: float,
+    requested_rank: int = 1,
+    actual_rank_used: int = 1,
 ) -> dict:
     return {
         "found": True,
@@ -430,6 +509,8 @@ def _route_response_json(
         "final_cash": final_cash,
         "total_profit": total_profit,
         "message": None,
+        "requested_rank": requested_rank,
+        "actual_rank_used": actual_rank_used,
     }
 
 
@@ -667,6 +748,52 @@ def test_app_shows_single_hop_route_buy_only_then_sell_only():
     # Running-cash invariant, once more on the smallest possible route.
     assert row1["Cash After"] == 130.0
     assert math.isclose(row1["Cash After"], 130.0, rel_tol=1e-9, abs_tol=1e-9)
+
+
+@respx.mock
+def test_rank_transparency_default_rank_shows_no_extra_messaging():
+    """`requested_rank == 1` (the default -- risk/reward slider left at 10)
+    is the common case and gets no extra rank messaging at all, matching
+    this app's plain/functional tone."""
+    at = _run_route_search(_minimal_found_route_response_json())
+
+    assert not list(at.warning)
+    assert not any("most-profitable route found" in caption.value for caption in at.caption)
+
+
+@respx.mock
+def test_rank_transparency_non_clamped_rank_shows_plain_caption_no_clamp_warning():
+    """`requested_rank == actual_rank_used` but not `1` (the user lowered
+    the risk/reward slider and got exactly the rank they asked for): a
+    plain caption names the rank, and no clamp warning appears."""
+    at = _run_route_search(
+        _minimal_found_route_response_json(requested_rank=3, actual_rank_used=3)
+    )
+
+    assert any(
+        "Showing the 3rd-most-profitable route found, as requested." in caption.value
+        for caption in at.caption
+    )
+    assert not list(at.warning)
+
+
+@respx.mock
+def test_rank_transparency_clamped_rank_shows_explicit_warning():
+    """`actual_rank_used != requested_rank` (fewer than `requested_rank`
+    distinct profitable routes existed, so `find_best_route` clamped down):
+    an explicit warning must say so, not silently show a rank the user
+    didn't ask for -- and the plain non-clamped caption must NOT also
+    appear."""
+    at = _run_route_search(
+        _minimal_found_route_response_json(requested_rank=5, actual_rank_used=2)
+    )
+
+    assert any(
+        "Only 2 distinct profitable routes were found; showing the least profitable one found."
+        in warning.value
+        for warning in at.warning
+    )
+    assert not any("as requested" in caption.value for caption in at.caption)
 
 
 @respx.mock
