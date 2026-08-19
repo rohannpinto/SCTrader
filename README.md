@@ -1,4 +1,4 @@
-# Star Citizen Trading Route Optimizer
+## About
 
 **Live: [sctrader.onrender.com](https://sctrader.onrender.com)**
 
@@ -16,7 +16,7 @@ FastAPI backend, Streamlit frontend, SQLite for the local data cache,
 ## Why not Dijkstra's? 
 
 - We're maximizing rather than minimizing
-- Loops are allowed and can be optimal a
+- Loops are allowed and can be optimal
 - Edge weight can't be precomputed.
 
 ## How does the search algorithm work?
