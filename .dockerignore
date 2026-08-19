@@ -1,0 +1,28 @@
+# Keeps the Docker build context small and fast, and is belt-and-suspenders
+# alongside the Dockerfile's explicit per-directory COPYs (which already
+# don't reference any of this) -- nothing here should ever end up in the
+# image either way.
+
+.git/
+.claude/
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.streamlit/
+
+# Local SQLite cache data -- the image gets a fresh empty data/ dir instead
+# (see Dockerfile), never a copy of whatever's on the host.
+data/
+
+# Local secrets -- never baked into an image. HF Spaces "Secrets" is the
+# equivalent mechanism at deploy time (see README.md).
+.env
+
+tests/
+docs/
+*.md
