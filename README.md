@@ -1,21 +1,244 @@
 # Star Citizen Trading Route Optimizer
 
-A local, all-Python web app that computes efficient Star Citizen commodity
-trading routes: given a starting terminal, a selected ship (its quantum
-drive range and cargo capacity), a hop-count budget, and a starting cash
-balance, it finds the walk through the trade network that maximizes final
-cash on hand, using live commodity price data pulled from
-`api.star-citizen.wiki` and UEX Corp. Only a curated allowlist of real
-tradeable materials/food/organics/vice commodities is considered --
-seasonal/cosmetic/placeholder catalog entries (e.g. event gifts, ship
-ammo, engine placeholders) are excluded during ingestion.
+**Live: [sctrader.onrender.com](https://sctrader.onrender.com)**
+· [LinkedIn](https://www.linkedin.com/in/rohan-n-pinto/)
+· [GitHub](https://github.com/rohannpinto)
 
-Backend is FastAPI + SQLite (a local on-disk cache of the two APIs) + an
-in-memory `networkx` graph rebuilt after every data refresh; frontend is
-Streamlit, talking to the backend over local HTTP only. No auth, no
-deployment concerns right now -- everything here runs on one machine. See
-`CLAUDE.md` for the full architecture, data model, hop-count/cash/cargo
-search algorithm, and security ground rules.
+Given a starting terminal, a ship, a hop budget, and a starting cash
+balance, this finds the sequence of buys and sells through *Star Citizen*'s
+in-game trade network that ends with the most money — using live commodity
+prices pulled from two public APIs.
+
+The interesting part isn't the web app. It's that "most profitable trade
+route" turns out to be a resource-constrained optimization problem on a
+cyclic directed graph that **standard shortest-path algorithms cannot
+solve**, and the search here is provably optimal rather than greedy. That
+argument is written out in [The routing problem](#the-routing-problem)
+below.
+
+> **Note on the free host:** the live site sleeps after 15 minutes of
+> inactivity, so the first request after a quiet period takes about a
+> minute to cold-start. It isn't broken; it's waking up.
+
+---
+
+## What it does
+
+- Pulls live terminal, commodity, price, distance, and ship data from
+  `api.star-citizen.wiki` and UEX Corp into a local SQLite cache.
+- Builds an in-memory `networkx` directed graph — currently **161
+  trade-capable terminals and ~24,900 directed edges** — rebuilt once per
+  data refresh, never per request.
+- Searches that graph for the walk (revisits and cycles allowed) that
+  maximizes final cash, respecting the selected ship's quantum-drive range
+  and cargo capacity and the user's cash on hand at every step.
+- Reports the route stop by stop: what to buy where, what to sell where,
+  how much of it, and the running cash balance.
+- Tells you **how stale the underlying prices are**, because that
+  determines whether any of the above is worth acting on.
+
+---
+
+## The routing problem
+
+### Why this isn't Dijkstra
+
+The obvious framing — "weight each edge by profit and find the best path" —
+fails on three counts:
+
+1. **We want to *maximize*, and cycles are legal.** Bouncing between two
+   terminals that trade profitably in both directions is a genuinely good
+   strategy in this game. A shortest-path algorithm with a flipped
+   comparator doesn't just give a wrong answer here; it **never
+   terminates**, because it can always improve by going around a
+   positive-weight cycle one more time.
+2. **Edge "profit" isn't a property of the edge.** How much you earn
+   crossing `a → b` depends on how much cash you have *when you arrive at
+   `a`* — with 5,000 aUEC you can only afford a few units of an expensive
+   commodity, so a cheaper one with a thinner per-unit margin can win
+   outright. The profit-maximizing commodity for an edge is a
+   search-time fact, not a graph-build-time one, so there is no static
+   weight to precompute.
+3. **The budget is a second dimension.** Every hop costs one hop from a
+   fixed allowance, independent of profit, so this is a *resource-
+   constrained* longest-walk problem — closer to a bounded knapsack over a
+   graph than to shortest paths.
+
+### The model
+
+- **Node** = one trade-capable terminal. Not a station: a single station
+  can host several terminals with different prices.
+- **Edge `a → b`** = a known directed distance. The graph is *not*
+  pre-filtered by distance; traversability is decided at search time by
+  whether `edge.distance <= ship_quantum_range`, so the same cached graph
+  serves every ship.
+- **Per-hop decision.** For edge `a → b` with cash `c` on hand, consider
+  every commodity with both a valid buy price at `a` and a valid sell price
+  at `b` (a set intersection, not a scan of the whole catalog). For each:
+
+  ```
+  quantity = min(floor(c / buy_price), ship_cargo_capacity)
+  profit   = quantity * (sell_price - buy_price)      # only if sell > buy
+  ```
+
+  The commodity maximizing **total** profit wins — not the best per-unit
+  margin. If nothing is profitable, the hop is a neutral "bridge" hop:
+  it still costs a hop, and is sometimes worth it to reach a good edge
+  further along.
+
+### The search: a bounded DP, and why one label per state is enough
+
+State is `(node, hops_used, cash)`. The search is a plain dynamic program
+over `hop = 1 … num_hops`: for every labelled state at `hop - 1`, try every
+in-range outgoing edge and keep the best result per `(node, hop)`.
+
+The load-bearing claim is that keeping only the **single highest-cash label
+per `(node, hop)`** loses nothing:
+
+> **Claim.** At a fixed `(node, hops_used)`, more cash weakly dominates
+> less cash.
+>
+> **Why.** Take labels `A` and `B` at the same state with
+> `cash(A) >= cash(B)`, and any identical future edge sequence. At each
+> step, `quantity = min(floor(cash / buy_price), cargo_cap)` is
+> monotonically non-decreasing in `cash`, and it is capped by the *same
+> fixed* `cargo_cap` regardless of which label is being extended. So `A`
+> can replicate every purchase `B` makes and afford at least as much of it,
+> leaving `A` with at least as much cash after every subsequent hop. `B`
+> can therefore never overtake `A`. ∎
+
+This is what makes the problem tractable: there's no second axis to trade
+off, so no Pareto frontier, no priority queue, and no per-node label cap.
+The state space is exactly `O(nodes × num_hops)` — bounded by construction
+rather than by a heuristic cutoff.
+
+Termination is *structural*, not merely resource-bounded: the DP is a fixed
+loop over hop counts, so it cannot re-queue a profitable cycle forever. A
+cycle just shows up as revisiting a node at a later hop with more cash.
+
+**Path reconstruction uses parent pointers**, not accumulated path tuples.
+An earlier version concatenated a new tuple onto a path at every hop,
+which made label creation itself `O(depth)` and left many long-lived labels
+each holding an independent long tuple — the post-search reference-counting
+teardown dominated wall time. Every label is now `O(1)` to create, and only
+the single winning label ever walks its chain back to the start.
+
+### Kth-best routes: the same proof, one level up
+
+The app has a risk/reward slider, because the *most* profitable route is
+also the one most likely to have already been flown by someone else before
+the price data even reached us. Lowering it asks for the Kth-best distinct
+route instead.
+
+Getting there greedily — "take the 2nd-best edge at each step" — would
+throw away optimality entirely, since a greedy walk can't look ahead the
+way the DP does. Instead the DP retains the **top-K labels per state**,
+sorted by cash. The correctness argument is the dominance proof applied one
+level up:
+
+> If a label falls outside the top-K retained at some state, it cannot
+> produce a route in the true global top-K. Each of the K labels ranked
+> above it, extended by that same future edge sequence, finishes with at
+> least as much cash — giving K distinct routes at least as good as
+> anything the discarded label could reach.
+
+So top-K pruning is exact, not a heuristic. `K = 1` dispatches to the
+original single-label DP, so the default path costs exactly what it did
+before.
+
+### Complexity and measured cost
+
+| | |
+|---|---|
+| States | `O(V × H)` — `V` terminals, `H` hop budget |
+| Labels retained | `O(V × H × K)` for the Kth-best variant |
+| Per-label work | one pass over in-range out-edges × the buy/sell commodity intersection |
+
+Measured on a synthetic 300-terminal / ~18,000-edge dataset (larger than
+the real game data): graph build **0.13–0.16 s**, bulk-loaded in three
+queries with no N+1. A wall-clock safety valve exists in the search but is
+not expected to fire — it's checked only between fully-completed hop
+levels, so a firing deadline always leaves the DP table consistent enough
+to read the best answer out of.
+
+---
+
+## Data quality: two bugs worth reading about
+
+Both produced *confidently wrong* output rather than crashes, which is what
+makes them worth writing down.
+
+**A $39.7 billion phantom route.** A live search returned a route earning
+39.7 billion aUEC. The cause: the wiki API reports a price of `0` for a
+commodity a terminal doesn't trade *in that direction*, and the search read
+`buy_price == 0` as "free — fill the entire hold." I checked the full
+distribution rather than patching the symptom: across all 2,004 real price
+rows, **every single row has exactly one of `price_buy`/`price_sell` equal
+to zero and the other strictly positive** — never both, never neither. That
+distribution is only explainable as "zero means not traded in this
+direction." Fixed at the ingestion boundary by normalizing those zeros to
+`NULL`, so "missing" and "genuinely zero" stay distinguishable everywhere
+downstream. The same live query then returned 657,418 aUEC — a real route.
+
+**Trading Luminalia Gifts for infinite money.** Before that, the search
+found a loop trading a seasonal holiday gift item. The commodity catalog
+includes non-tradeable entries — event gifts, ship ammunition, cosmetics,
+and engine placeholders like `Heat` and `Life Support`. Ingestion now
+applies a curated allowlist over the API's own `commodity_groups` tags,
+verified against all 206 live commodities: **157 pass, 49 excluded.** The
+rule is OR-semantics across groups, which matters — a strict AND would have
+wrongly dropped every refined drug and synthetic material in the game,
+since those carry a legitimate tag *and* the mixed-bag `ProcessedGoods` tag.
+
+**And one honesty problem.** With an hourly auto-refresh running, the UI's
+"last refreshed: minutes ago" read as "this data is current." It isn't —
+prices are crowd-sourced player sightings. Measured across the real
+dataset: **median report age ~7 days, and not one row under 24 hours old.**
+The app now surfaces that distribution directly, with a fresh-to-rotten
+meter, so a visitor can judge whether to trust it at all. That gap is also
+the entire reason the risk/reward slider exists.
+
+---
+
+## Architecture
+
+```
+backend/
+  clients/      wiki + UEX API clients (retry/backoff, pagination)
+  ingest/       API -> SQLite cache: ID joining, curation, zero-price normalization
+  graph/        builder (cache -> DiGraph) | search (the DP) | cache (singleton)
+  routers/      /terminals /ships /route /refresh /refresh-status
+  models/       SQLAlchemy tables + Pydantic request/response schemas
+frontend/       Streamlit UI (server-side HTTP to the backend only)
+tests/          unit | integration | perf | recorded API fixtures
+```
+
+**Two-tier caching.** SQLite on disk is the source of truth; an in-memory
+`GraphCache` singleton holds the graph and the bulk-loaded price indices.
+`rebuild()` constructs a whole new snapshot and swaps the reference in one
+step, so an in-flight request sees either the fully-old or fully-new graph
+— never a half-populated one, and no locking on the read path. A small LRU
+cache sits on `/route` results, keyed on the search parameters plus a data
+version that changes on every refresh, making it self-invalidating.
+
+**Refresh safety.** An in-process lock means a manual refresh and a
+scheduled one can never run concurrently (the second gets a `409`), so the
+external APIs are never double-hit. SQLite runs in WAL mode so the refresh
+writer and route readers don't block each other.
+
+**Security.** ORM/parameterized queries only, no raw SQL; no
+shell/subprocess anywhere; all input bounds-checked server-side
+independently of what the UI allows; rate limiting on every endpoint;
+generic error responses that never leak internals. Terminal and commodity
+names are untrusted crowd-sourced strings and are never rendered as markup
+— enforced by an AST-based test that fails if any `unsafe_allow_html` call
+site receives anything but a static literal.
+
+**296 tests**, including hand-computed algorithm scenarios, a brute-force
+cross-check of the optimality argument, adversarial input cases, and
+opt-in live-API and performance suites.
+
+---
 
 ## Setup
 
@@ -25,9 +248,9 @@ py -3.12 -m venv .venv
 pip install -r requirements.txt
 ```
 
-Copy `.env.example` to `.env` and adjust values as needed -- every setting
-has a working default, so this is optional for local use. `.env` is
-gitignored and loaded automatically by `backend/config.py`.
+Copy `.env.example` to `.env` and adjust as needed — every setting has a
+working default, so this is optional for local use. `.env` is gitignored
+and loaded automatically by `backend/config.py`.
 
 ## Running
 
@@ -43,48 +266,31 @@ uvicorn backend.main:app --reload
 streamlit run frontend/app.py
 ```
 
-The backend pre-warms its in-memory graph from whatever's already in
-`data/cache.db` on startup, but that cache starts out empty on a fresh
-checkout. Populate it once before searching for routes, either:
+The cache starts empty on a fresh checkout. Populate it once:
 
 ```powershell
-# One-off, from the command line -- doesn't need the backend running:
-python scripts/refresh_data.py
+python scripts/refresh_data.py     # doesn't need the backend running
 ```
 
-or, with the backend already running, `POST http://localhost:8000/refresh`
-(add an `X-Refresh-Token` header if `REFRESH_TOKEN` is set in `.env`). This
-populates terminals, curated commodities, prices, distances, and real
-player ships (quantum drive range + cargo capacity, from
-`api.star-citizen.wiki`'s `/vehicles` data). Then open the Streamlit URL it
-prints (default `http://localhost:8501`) to pick a starting terminal
-(searchable, filterable by star system and planetoid), a ship, a hop-count
-budget, and a starting cash balance, and search for a route -- the
-selected ship's quantum range gates which hops are reachable, and its
-cargo capacity caps how much of a commodity can be traded per hop.
-`GET /refresh-status` reports the most recent refresh's outcome, row
-counts (including ships), and any warnings. `GET /ships` and `GET
-/terminals` list what's currently available to search over.
+or `POST http://localhost:8000/refresh` with the backend up (add an
+`X-Refresh-Token` header if `REFRESH_TOKEN` is set). Then open the
+Streamlit URL it prints (default `http://localhost:8501`).
 
-A refresh takes a little while (it calls both external APIs); `/refresh` is
-rate-limited and rejects a second concurrent call with `409` while one is
-already running.
+A refresh takes a little while — it calls both external APIs — and is
+rate-limited; a second concurrent call gets `409`.
 
 ## Testing
 
 ```powershell
-pytest                    # default suite: fast, fully offline, respx-mocked
-pytest -m live             # opt-in: hits the real external APIs once, checks for schema drift
-pytest -m perf              # opt-in: synthetic large-graph performance benchmark
-pytest -m "live or perf"     # both opt-in groups explicitly
+pytest                    # default: fast, fully offline, respx-mocked
+pytest -m live             # opt-in: hits the real APIs once, checks for schema drift
+pytest -m perf              # opt-in: synthetic large-graph benchmark
 ```
 
-The default `pytest` run is what CI/a pre-commit check should use -- it
-never touches the network and finishes in well under a minute. `-m live`
-is a manual sanity check against the real wiki/UEX APIs (schema drift,
-endpoint availability); `-m perf` is a synthetic-data benchmark, not a
-correctness check, and its timing bounds are deliberately generous so it
-stays reliable on a slow machine.
+The default run never touches the network and finishes in a couple of
+minutes. `-m live` is a manual sanity check against the real wiki/UEX APIs;
+`-m perf` is a benchmark rather than a correctness check, with deliberately
+generous bounds so it stays reliable on a slow machine.
 
 ## Deployment: Render (Docker, free tier)
 
@@ -146,14 +352,26 @@ differently.)
   refresh (see below) repopulates the cache DB from scratch on every fresh
   boot, so a visitor never sees a permanently empty app -- just the normal
   cold-start wait, plus however long that one refresh takes.
+- **Bind the backend to loopback, not `0.0.0.0` -- this one bit us.**
+  Render decides which port to route your public URL to by **scanning for
+  open ports inside the container**. With the backend listening on
+  `0.0.0.0:8000` alongside Streamlit on `$PORT`, Render saw *two* open
+  ports, and the deployed URL intermittently returned a bare **"Not
+  Found"** -- traffic landing on FastAPI's undefined `/` route. Render's
+  own logs gave it away: `Detected a new open port HTTP:8000` appearing
+  *after* the service was already declared live on the right port. The fix
+  is one flag: `start_web_container.sh` starts uvicorn on `127.0.0.1:8000`,
+  so only Streamlit's port is visible to the scanner. Note that verifying
+  a port is merely un-*published* by Docker (`docker port`, `-p` flags)
+  does **not** catch this -- Render never consults Docker's port
+  publishing.
 - **`/refresh` exposure.** Same architecture, same conclusion as the
   Hugging Face section below, just a different platform doing the routing:
   in this single-container design, the FastAPI backend (port 8000,
   including `/refresh`) is **never reachable from the public internet at
-  all** -- Render only routes external traffic to the one port your
-  service binds via `$PORT` (Streamlit's port); port 8000 only exists
-  inside the container, and the only thing that ever calls it is
-  Streamlit's own Python process, over `localhost`. That gives the entire
+  all** -- it is bound to loopback (see above), so it exists only inside
+  the container, and the only thing that ever calls it is Streamlit's own
+  Python process, over `localhost`. That gives the entire
   backend API surface real protection "for free," on top of whatever the
   app's own auth/rate-limiting already provides. The one caveat, unchanged
   from the Hugging Face case: the "Refresh data now" button *inside* the
