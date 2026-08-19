@@ -258,46 +258,92 @@ def _status_with_price_age(
     return status
 
 
-@respx.mock
-def test_sidebar_reports_price_report_age_in_days():
+def _ribbon_text(at: AppTest) -> str:
+    """All visible non-HTML text on the page, joined.
+
+    The data ribbon mixes `st.markdown` (the headline figure) and
+    `st.caption` (supporting detail), so assertions read across both rather
+    than depending on which element type a given string happens to land in.
+    The theme `<style>` block is excluded -- it's HTML markdown, not copy.
+    """
+    captions = [c.value for c in at.caption]
+    markdown = [m.value for m in at.markdown if not m.proto.allow_html]
+    return " ".join(captions + markdown)
+
+
+def _run_with_status(status: dict) -> AppTest:
     respx.get(f"{BACKEND_BASE_URL}/refresh-status").mock(
-        return_value=httpx.Response(200, json=_status_with_price_age(median_age_days=7.04))
+        return_value=httpx.Response(200, json=status)
     )
     respx.get(f"{BACKEND_BASE_URL}/terminals").mock(return_value=httpx.Response(200, json=[]))
     respx.get(f"{BACKEND_BASE_URL}/ships").mock(return_value=httpx.Response(200, json=[]))
-
     at = AppTest.from_file(APP_PATH)
     at.run()
-
-    assert not at.exception
-    captions = " ".join(c.value for c in at.sidebar.caption)
-    assert "7.0 days" in captions
-    # The caveat naming *why* the age matters must accompany the number --
-    # a bare "7.0 days" doesn't tell a user the prices may have moved.
-    assert "crowd-sourced" in captions
+    return at
 
 
 @respx.mock
-def test_sidebar_distinguishes_fetch_time_from_report_age():
+def test_ribbon_reports_price_report_age_in_days():
+    at = _run_with_status(_status_with_price_age(median_age_days=7.04))
+
+    assert not at.exception
+    text = _ribbon_text(at)
+    assert "7.0 days" in text
+    # The caveat naming *why* the age matters must accompany the number --
+    # a bare "7.0 days" doesn't tell a user the prices may have moved.
+    assert "crowd-sourced" in text
+
+
+@respx.mock
+def test_ribbon_distinguishes_fetch_time_from_report_age():
     """"Last fetched" and "price report age" must be presented as different
     things -- the misleading behavior this feature fixes was showing only
     the former, which reads as "the data is current"."""
-    respx.get(f"{BACKEND_BASE_URL}/refresh-status").mock(
-        return_value=httpx.Response(200, json=_status_with_price_age(median_age_days=7.0))
-    )
-    respx.get(f"{BACKEND_BASE_URL}/terminals").mock(return_value=httpx.Response(200, json=[]))
-    respx.get(f"{BACKEND_BASE_URL}/ships").mock(return_value=httpx.Response(200, json=[]))
+    at = _run_with_status(_status_with_price_age(median_age_days=7.0))
 
-    at = AppTest.from_file(APP_PATH)
-    at.run()
-
-    captions = " ".join(c.value for c in at.sidebar.caption)
-    assert "Last fetched from APIs" in captions
-    assert "7.0 days" in captions
+    text = _ribbon_text(at)
+    assert "Last fetched from APIs" in text
+    assert "7.0 days" in text
 
 
 @respx.mock
-def test_sidebar_formats_sub_day_price_age_in_hours():
+def test_ribbon_staleness_bar_fill_tracks_age():
+    """The fresh->rotten bar must actually move with the data's age.
+
+    `st.progress` stores its value as an integer percentage, and the meter
+    is scaled so full-scale (`_STALENESS_ROTTEN_DAYS`) is 14 days -- so
+    3.5 days is a quarter full, 7 days half, and so on. A bar that didn't
+    track the age would be worse than no bar (it would falsely reassure).
+
+    Note: which *color* the bar takes is set by a static CSS rule selected
+    via `st.container(key=...)`, and container keys aren't exposed through
+    AppTest's element tree, so the key->color binding is covered separately
+    by `test_theme_css_defines_every_staleness_bucket_color` rather than
+    end-to-end here.
+    """
+    for median_age_days, expected_percent in [(0.0, 0), (3.5, 25), (7.0, 50), (14.0, 100)]:
+        at = _run_with_status(_status_with_price_age(median_age_days=median_age_days))
+        assert not at.exception
+        bars = at.get("progress")
+        assert bars, f"no staleness bar rendered for {median_age_days} days"
+        assert (
+            bars[0].value == expected_percent
+        ), f"{median_age_days} days should fill the bar to {expected_percent}%"
+
+
+@respx.mock
+def test_ribbon_staleness_bar_pins_at_full_scale_for_very_old_data():
+    """A 34-day median (real data has rows that old) must pin the bar to
+    the right rather than overflowing past full scale, which `st.progress`
+    would reject outright."""
+    at = _run_with_status(_status_with_price_age(median_age_days=34.0))
+
+    assert not at.exception
+    assert at.get("progress")[0].value == 100
+
+
+@respx.mock
+def test_ribbon_formats_sub_day_price_age_in_hours():
     """A genuinely fresh dataset must not render as an uninformative
     "0.2 days"."""
     respx.get(f"{BACKEND_BASE_URL}/refresh-status").mock(
@@ -311,13 +357,13 @@ def test_sidebar_formats_sub_day_price_age_in_hours():
     at = AppTest.from_file(APP_PATH)
     at.run()
 
-    captions = " ".join(c.value for c in at.sidebar.caption)
+    captions = " ".join(c.value for c in at.caption)
     assert "6 hours" in captions
     assert "0.2 days" not in captions
 
 
 @respx.mock
-def test_sidebar_omits_price_age_when_backend_reports_none():
+def test_ribbon_omits_price_age_when_backend_reports_none():
     """A backend with no priced rows yet (`price_data_age: null`) must
     render no age section at all, not a "0 days old" one."""
     status = _never_run_status()
@@ -332,7 +378,7 @@ def test_sidebar_omits_price_age_when_backend_reports_none():
     at.run()
 
     assert not at.exception
-    captions = " ".join(c.value for c in at.sidebar.caption)
+    captions = " ".join(c.value for c in at.caption)
     assert "crowd-sourced" not in captions
     assert "days** old" not in captions
 
@@ -371,7 +417,7 @@ def test_app_shows_error_when_backend_unreachable():
     at.run()
 
     assert not at.exception
-    assert any("Could not reach the backend" in warning.value for warning in at.sidebar.warning)
+    assert any("Could not reach the backend" in warning.value for warning in at.warning)
     assert any("Could not reach the backend" in error.value for error in at.error)
 
 
@@ -458,6 +504,7 @@ def test_risk_level_slider_defaults_to_10_and_sends_it_untouched():
     assert slider.max == 10
     assert slider.value == 10  # default preserves pre-Phase-3 behavior
 
+    _select_first_terminal(at)  # "Terminal" is required; nothing is selected by default
     _find_button(at, "Find best route").click().run(timeout=15)
     assert not at.exception
 
@@ -475,6 +522,7 @@ def test_risk_level_slider_moved_value_is_sent_in_request():
     at = AppTest.from_file(APP_PATH)
     at.run()
     _find_slider(at, "Risk / reward").set_value(3).run()
+    _select_first_terminal(at)  # "Terminal" is required; nothing is selected by default
     _find_button(at, "Find best route").click().run(timeout=15)
     assert not at.exception
 
@@ -540,7 +588,7 @@ def test_orbital_station_checkbox_defaults_checked_and_filters_when_unchecked():
     orbital_checkbox = _find_checkbox(at, "Include orbital stations")
     assert orbital_checkbox.value is True  # default CHECKED
 
-    terminal_box = _find_selectbox(at, "Starting terminal")
+    terminal_box = _find_selectbox(at, "Terminal")
     assert terminal_box.options == [
         "Lorville - Trade and Development Division (Stanton)",
         "Everus Harbor (Stanton)",
@@ -548,7 +596,7 @@ def test_orbital_station_checkbox_defaults_checked_and_filters_when_unchecked():
 
     orbital_checkbox.uncheck().run()
 
-    terminal_box = _find_selectbox(at, "Starting terminal")
+    terminal_box = _find_selectbox(at, "Terminal")
     assert terminal_box.options == ["Lorville - Trade and Development Division (Stanton)"]
 
 
@@ -564,11 +612,11 @@ def test_gateway_terminal_only_reachable_via_planetoid_all():
     at.run()
     _find_selectbox(at, "System").select("Stanton").run()
 
-    terminal_box = _find_selectbox(at, "Starting terminal")
+    terminal_box = _find_selectbox(at, "Terminal")
     assert any("Terra Gateway" in option for option in terminal_box.options)
 
     _find_selectbox(at, "Planetoid").select("Hurston").run()
-    terminal_box = _find_selectbox(at, "Starting terminal")
+    terminal_box = _find_selectbox(at, "Terminal")
     assert not any("Terra Gateway" in option for option in terminal_box.options)
 
 
@@ -588,7 +636,7 @@ def test_filters_can_exclude_every_terminal():
 
     assert not at.exception
     assert any("No terminals match" in warning.value for warning in at.warning)
-    assert not [box for box in at.selectbox if box.label == "Starting terminal"]
+    assert not [box for box in at.selectbox if box.label == "Terminal"]
 
 
 @respx.mock
@@ -601,7 +649,7 @@ def test_starting_terminal_selectbox_uses_contains_filter_mode():
     at = AppTest.from_file(APP_PATH)
     at.run()
 
-    terminal_box = _find_selectbox(at, "Starting terminal")
+    terminal_box = _find_selectbox(at, "Terminal")
     assert terminal_box.proto.filter_mode == SelectWidgetFilterMode_pb2.FILTER_MODE_CONTAINS
 
 
@@ -649,20 +697,43 @@ def _route_response_json(
     }
 
 
-def _run_route_search(route_response_json: dict):
-    """Mocks status/terminals/ships/route, runs the app, clicks "Find best
-    route" with the default (first-listed) starting terminal and ship
-    selections, and returns the resulting `AppTest`."""
-    _mock_status_terminals_ships(terminals=_terminals_payload(), ships=_ships_payload())
+def _run_route_search(route_response_json: dict, *, status: dict | None = None):
+    """Mocks status/terminals/ships/route, runs the app, selects a starting
+    terminal, clicks "Find best route", and returns the resulting `AppTest`.
+
+    The terminal selection is explicit because "Terminal" is a *required*
+    field with no default (`index=None`) -- without it the submit
+    short-circuits with "Pick a terminal." and never issues a request.
+    """
+    respx.get(f"{BACKEND_BASE_URL}/refresh-status").mock(
+        return_value=httpx.Response(200, json=status if status is not None else _never_run_status())
+    )
+    respx.get(f"{BACKEND_BASE_URL}/terminals").mock(
+        return_value=httpx.Response(200, json=_terminals_payload())
+    )
+    respx.get(f"{BACKEND_BASE_URL}/ships").mock(
+        return_value=httpx.Response(200, json=_ships_payload())
+    )
     respx.post(f"{BACKEND_BASE_URL}/route").mock(
         return_value=httpx.Response(200, json=route_response_json)
     )
 
     at = AppTest.from_file(APP_PATH)
     at.run()
+    _select_first_terminal(at)
     _find_button(at, "Find best route").click().run(timeout=15)
     assert not at.exception
     return at
+
+
+def _select_first_terminal(at: AppTest) -> None:
+    """Select whichever terminal the "Terminal" picker lists first.
+
+    Tests that only need *a* valid starting terminal use this; tests that
+    care which one select explicitly by label.
+    """
+    terminal_box = _find_selectbox(at, "Terminal")
+    terminal_box.select(terminal_box.options[0]).run()
 
 
 @respx.mock
@@ -906,6 +977,7 @@ def test_results_caveat_names_price_age_at_the_point_of_decision():
 
     at = AppTest.from_file(APP_PATH)
     at.run()
+    _select_first_terminal(at)  # "Terminal" is required; nothing is selected by default
     _find_button(at, "Find best route").click().run(timeout=15)
 
     assert not at.exception
@@ -990,6 +1062,7 @@ def test_app_shows_not_found_message():
 
     at = AppTest.from_file(APP_PATH)
     at.run()
+    _select_first_terminal(at)  # "Terminal" is required; nothing is selected by default
     _find_button(at, "Find best route").click().run(timeout=15)
 
     assert not at.exception
@@ -997,6 +1070,81 @@ def test_app_shows_not_found_message():
 
 
 # --- visual theme: background image + "sci-fi HUD" styling -----------------------
+
+
+@respx.mock
+def test_terminal_is_required_and_submitting_without_one_errors():
+    """"Terminal" has no default selection, and submitting without one must
+    say so plainly rather than silently searching from whichever terminal
+    happened to sort first -- the starting point determines the entire
+    route, so defaulting it would hand back an answer to a question the
+    user never asked."""
+    _mock_status_terminals_ships(terminals=_terminals_payload(), ships=_ships_payload())
+    route = respx.post(f"{BACKEND_BASE_URL}/route").mock(
+        return_value=httpx.Response(200, json=_minimal_found_route_response_json())
+    )
+
+    at = AppTest.from_file(APP_PATH)
+    at.run()
+
+    # Nothing selected by default.
+    assert _find_selectbox(at, "Terminal").value is None
+
+    _find_button(at, "Find best route").click().run(timeout=15)
+
+    assert not at.exception
+    assert any("Pick a terminal" in error.value for error in at.error)
+    # And crucially, no request was issued at all.
+    assert not route.calls
+
+
+@respx.mock
+def test_terminal_selection_then_submit_issues_the_request():
+    """The counterpart to the guard above: once a terminal *is* chosen, the
+    same submit goes through and sends that terminal's id."""
+    _mock_status_terminals_ships(terminals=_terminals_payload(), ships=_ships_payload())
+    route = respx.post(f"{BACKEND_BASE_URL}/route").mock(
+        return_value=httpx.Response(200, json=_minimal_found_route_response_json())
+    )
+
+    at = AppTest.from_file(APP_PATH)
+    at.run()
+    # `.options` are the *formatted labels* the picker displays; `.value`
+    # after selecting is the underlying terminal id the request should carry.
+    terminal_box = _find_selectbox(at, "Terminal")
+    terminal_box.select(terminal_box.options[0]).run()
+    chosen_id = _find_selectbox(at, "Terminal").value
+    _find_button(at, "Find best route").click().run(timeout=15)
+
+    assert not at.exception
+    assert not any("Pick a terminal" in error.value for error in at.error)
+    sent_payload = json.loads(route.calls.last.request.content)
+    assert sent_payload["start_terminal_id"] == chosen_id
+
+
+@respx.mock
+def test_theme_css_defines_every_staleness_bucket_color():
+    """Each staleness bucket must have a matching CSS rule.
+
+    `_render_staleness_meter` picks a container key from a fixed set
+    (`sc_staleness_fresh|aging|stale`) and relies on a static rule existing
+    for it. Container keys aren't visible through AppTest's element tree, so
+    a bucket whose rule was renamed or dropped would silently render in
+    Streamlit's default color with nothing failing -- this asserts the CSS
+    half of that contract, and `_staleness_bucket`'s docstring is the other.
+    """
+    _mock_status_terminals_ships(terminals=_terminals_payload(), ships=_ships_payload())
+
+    at = AppTest.from_file(APP_PATH)
+    at.run()
+
+    css = [m for m in at.markdown if m.proto.allow_html][0].value
+    for bucket in ("fresh", "aging", "stale"):
+        assert f".st-key-sc_staleness_{bucket}" in css, f"no CSS rule for {bucket!r} staleness"
+    # The ribbon is the one boxed element; the main content block must NOT
+    # carry the old panel background/border (the page is otherwise seamless
+    # with the photo).
+    assert ".st-key-sc_data_ribbon" in css
 
 
 @respx.mock
@@ -1039,19 +1187,34 @@ def test_theme_css_is_injected_with_background_and_hud_styling():
 
 
 @respx.mock
-def test_background_attribution_caption_rendered_in_sidebar():
+def test_background_attribution_caption_rendered_in_footer():
     """A visible, unobtrusive credit for the bundled background image must
-    appear in the sidebar footer, naming NASA/the license -- a real
-    licensing condition (see `frontend/app.py`'s comment at
-    `_inject_theme_css()`), not optional polish."""
+    appear in the page footer, naming NASA/the license -- a real licensing
+    condition (see `frontend/app.py`'s comment at `_inject_theme_css()`),
+    not optional polish. Lives in the footer now that the sidebar it used
+    to sit in is gone."""
     _mock_status_terminals_ships(terminals=_terminals_payload(), ships=_ships_payload())
 
     at = AppTest.from_file(APP_PATH)
     at.run()
 
     assert not at.exception
-    sidebar_captions = [c.value for c in at.sidebar.caption]
-    assert any("NASA" in value and "public domain" in value for value in sidebar_captions)
+    footer_captions = [c.value for c in at.caption]
+    assert any("NASA" in value and "public domain" in value for value in footer_captions)
+
+
+@respx.mock
+def test_footer_links_to_author_profiles():
+    """The footer carries the author's LinkedIn/GitHub links."""
+    _mock_status_terminals_ships(terminals=_terminals_payload(), ships=_ships_payload())
+
+    at = AppTest.from_file(APP_PATH)
+    at.run()
+
+    assert not at.exception
+    captions = " ".join(c.value for c in at.caption)
+    assert "https://www.linkedin.com/in/rohan-n-pinto/" in captions
+    assert "https://github.com/rohannpinto" in captions
 
 
 def test_background_asset_bundled_locally_and_reasonably_sized():

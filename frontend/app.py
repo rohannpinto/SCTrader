@@ -51,12 +51,22 @@ language rather than echoing those raw 1-10 numbers next to the 0-10
 `risk_level` scale the user actually set (the two scales don't line up
 1:1, so showing both risks a confusing mismatch -- see `_ordinal`).
 
-Price-report age: the sidebar (`_render_price_data_age`) and the results
+Price-report age: the data ribbon (`_render_data_ribbon`) and the results
 area both surface `RefreshStatusOut.price_data_age` -- how old the
 underlying crowd-sourced price *reports* are, which is a different and far
 more decision-relevant fact than when this app last *fetched* them. See
 CLAUDE.md's "Price-report age vs. fetch time" section; showing only the
 fetch timestamp made a week-old dataset read as current.
+
+Layout: there is no sidebar and no page title. The page is, top to bottom,
+a boxed **data ribbon** (`_render_data_ribbon`: staleness meter, last
+fetch, row counts, refresh control), then two unboxed sections --
+**Constraints** (ship, hops, budget, risk/reward) and **Starting area**
+(system/planetoid/orbital filters, then the *required* terminal picker) --
+then results, then a footer with author links and the background image's
+required credit. The ribbon is deliberately the only boxed element on the
+page: everything else sits directly on the background photo, so being
+boxed is what marks the ribbon as a distinct status panel.
 """
 
 from __future__ import annotations
@@ -79,6 +89,20 @@ REFRESH_TIMEOUT_SECONDS = 120.0  # /refresh can take a while: several external A
 #: Planetoid dropdowns below. Not a real system/planetoid name, so it can
 #: never collide with live data.
 _ALL_OPTION = "All"
+
+#: Author links, rendered in the page footer.
+_LINKEDIN_URL = "https://www.linkedin.com/in/rohan-n-pinto/"
+_GITHUB_URL = "https://github.com/rohannpinto"
+
+#: Staleness meter calibration, in days of price-report age. Set against
+#: what actually matters for trading rather than round numbers: under
+#: `_STALENESS_AGING_DAYS` a price is usually still good, by
+#: `_STALENESS_STALE_DAYS` it's genuinely questionable, and
+#: `_STALENESS_ROTTEN_DAYS` is full-scale on the bar (anything beyond pins
+#: to the right rather than overflowing). See `_staleness_bucket`.
+_STALENESS_AGING_DAYS = 3.0
+_STALENESS_STALE_DAYS = 7.0
+_STALENESS_ROTTEN_DAYS = 14.0
 
 #: Bundled background image + its attribution, kept together so the code
 #: comment and the on-screen credit can never drift apart. See
@@ -220,13 +244,70 @@ def _inject_theme_css() -> None:
             color: var(--sc-text-primary);
         }}
 
-        /* Main content sits on a translucent dark "HUD panel" over the photo. */
+        /* Main content is deliberately UNBOXED -- it sits directly on the
+           photo/scrim so the page reads as one seamless scene. The data
+           ribbon below is the single exception, and being the only boxed
+           element is what makes it read as a distinct status panel. Text
+           legibility over the photo comes from the scrim gradient above
+           plus the text-shadow rule further down, not from a panel. */
         [data-testid="stMain"] .block-container {{
+            background: transparent;
+            border: none;
+            box-shadow: none;
+            padding: 2rem 2.5rem 3rem;
+        }}
+
+        /* The one boxed element on the page: the data-status ribbon.
+           Targeted via Streamlit's documented `st-key-<key>` class hook
+           (`st.container(border=True, key="sc_data_ribbon")`) rather than an
+           auto-generated Emotion class, so this selector is stable. */
+        .st-key-sc_data_ribbon {{
             background: var(--sc-panel-bg);
             border: 1px solid var(--sc-panel-border);
-            border-radius: 16px;
-            padding: 2rem 2.5rem 3rem;
-            box-shadow: 0 0 48px rgba(0, 0, 0, 0.5);
+            border-radius: 14px;
+            padding: 1rem 1.25rem;
+            box-shadow: 0 0 32px rgba(0, 0, 0, 0.45);
+        }}
+
+        /* Staleness bar. Three fixed buckets, each a *static* rule selected
+           by which container key the caller used -- the bar's value goes
+           through the native `st.progress` widget, so nothing here
+           interpolates a computed value into markup (keeping this whole
+           <style> block a fixed literal; see the security note above). */
+        .st-key-sc_staleness_fresh [role="progressbar"] > div {{
+            background-image: linear-gradient(90deg, #35d07f, #7ddba3) !important;
+        }}
+        .st-key-sc_staleness_aging [role="progressbar"] > div {{
+            background-image: linear-gradient(90deg, #e8c15a, #ffb454) !important;
+        }}
+        .st-key-sc_staleness_stale [role="progressbar"] > div {{
+            background-image: linear-gradient(90deg, #ff8a5c, #ff5c5c) !important;
+        }}
+
+        /* Section headings ("Constraints", "Starting area") -- unboxed, so
+           a left accent rule carries the visual separation a panel edge
+           used to. */
+        [data-testid="stMain"] h2 {{
+            border-left: 3px solid var(--sc-accent-cyan);
+            padding-left: 0.6rem;
+            margin-top: 1.5rem;
+        }}
+
+        /* Unboxed body text sits directly on the photo, so it gets a soft
+           shadow for legibility that the panel background used to provide. */
+        [data-testid="stMain"] [data-testid="stMarkdownContainer"] p,
+        [data-testid="stMain"] [data-testid="stWidgetLabel"] p {{
+            text-shadow: 0 1px 3px rgba(0, 0, 0, 0.85);
+        }}
+
+        /* Page footer (attribution + profile links). */
+        .st-key-sc_footer {{
+            border-top: 1px solid var(--sc-panel-border);
+            margin-top: 2.5rem;
+            padding-top: 1rem;
+        }}
+        .st-key-sc_footer a {{
+            color: var(--sc-accent-cyan);
         }}
 
         [data-testid="stAppViewContainer"] [data-testid="stMarkdownContainer"] p,
@@ -475,112 +556,175 @@ def _format_age_days(days: float) -> str:
     return f"{days:.1f} days"
 
 
-def _render_price_data_age(status: dict) -> None:
-    """Surfaces how old the underlying *price reports* are -- not to be
-    confused with when this app last fetched them (`completed_at`, rendered
-    separately above this).
+def _staleness_bucket(median_age_days: float) -> str:
+    """Which of the three fixed staleness bands `median_age_days` falls in.
 
-    This distinction is the single most decision-relevant fact in the whole
-    sidebar and was previously invisible: with the hourly auto-refresh
-    scheduler running, "last fetched" is essentially always "minutes ago,"
-    which reads as "this data is current." The prices themselves are
-    crowd-sourced player observations that are typically *days* old (real
-    measured dataset: median ~5-7 days, nothing under 24 hours), and a
-    route computed from a week-old price may simply not exist any more when
-    the player flies it. That gap is also the entire reason this app has a
-    risk/reward slider, so naming it plainly here makes the slider's purpose
-    legible instead of mysterious.
+    Returns one of `"fresh"` / `"aging"` / `"stale"` -- used only to pick a
+    `st.container(key=...)` from a fixed set of literals, which in turn
+    selects a *static* CSS rule for the bar's color (see
+    `_inject_theme_css`). Nothing computed is ever interpolated into markup.
+
+    Bands are set against what actually matters for trading, not round
+    numbers: under ~3 days a price is usually still good; by a week it is
+    genuinely questionable; past that a route may simply not exist any more.
+    Against the real dataset (median ~5-7 days) this honestly lands in
+    "aging"/"stale" most of the time, which is the point -- the bar exists
+    to tell a user whether to trust the site, not to reassure them.
     """
-    age = status.get("price_data_age")
-    if not age:
-        return
+    if median_age_days < _STALENESS_AGING_DAYS:
+        return "fresh"
+    if median_age_days < _STALENESS_STALE_DAYS:
+        return "aging"
+    return "stale"
 
-    st.sidebar.markdown("**Price report age**")
-    st.sidebar.caption(
-        f"Median: **{_format_age_days(age['median_age_days'])}** old  \n"
-        f"Freshest: {_format_age_days(age['min_age_days'])} · "
-        f"Stalest: {_format_age_days(age['max_age_days'])}"
+
+def _staleness_fraction(median_age_days: float) -> float:
+    """`median_age_days` mapped onto the 0.0 (fresh) -> 1.0 (rotten) bar,
+    clamped at both ends.
+
+    Full scale is `_STALENESS_ROTTEN_DAYS`; anything at or beyond it pins
+    the bar to the right rather than overflowing, so a 34-day outlier
+    reads as "rotten" instead of silently wrapping or erroring.
+    """
+    return max(0.0, min(1.0, median_age_days / _STALENESS_ROTTEN_DAYS))
+
+
+def _render_staleness_meter(age: dict) -> None:
+    """The fresh -> rotten bar plus its headline number.
+
+    The bar's geometry goes through the native `st.progress` widget (so no
+    HTML is constructed here at all); its *color* comes from which of three
+    fixed container keys wraps it. See `_staleness_bucket`.
+    """
+    median_days = age["median_age_days"]
+    bucket = _staleness_bucket(median_days)
+
+    st.markdown(f"**Data freshness** · median price age **{_format_age_days(median_days)}**")
+    with st.container(key=f"sc_staleness_{bucket}"):
+        st.progress(_staleness_fraction(median_days))
+    st.caption(f"Scale: fresh (0 days) → rotten ({_STALENESS_ROTTEN_DAYS:.0f}+ days)")
+    st.caption(
+        f"Freshest report {_format_age_days(age['min_age_days'])} · "
+        f"stalest {_format_age_days(age['max_age_days'])}. "
+        "Prices are crowd-sourced player reports, not a live game feed, so they "
+        "may have drifted in-game since."
     )
-    st.sidebar.caption(
-        "Prices are crowd-sourced player reports, not a live game feed — "
-        "they are typically days old and may have changed in-game since. "
-        "Lower the risk/reward slider for routes that are likely less "
-        "picked-over."
-    )
 
 
-def _render_sidebar(status: dict | None) -> None:
-    st.sidebar.header("Data")
+def _render_data_ribbon(status: dict | None) -> None:
+    """The one boxed element on the page: a status ribbon across the top.
 
-    if status is None:
-        st.sidebar.warning(
-            f"Could not reach the backend at {BACKEND_BASE_URL}. Is it running?"
-        )
-    else:
-        st.sidebar.write(f"Status: **{status['status']}**")
-        if status.get("completed_at"):
-            # Deliberately "fetched", not "updated": this is when *this app*
-            # last pulled from the external APIs, which says nothing about how
-            # old the prices themselves are -- see `_render_price_data_age`.
-            st.sidebar.caption(f"Last fetched from APIs: {status['completed_at']}")
-        if status.get("terminals_count") is not None:
-            st.sidebar.caption(
-                f"{status['terminals_count']} terminals · {status['commodities_count']} commodities · "
-                f"{status['prices_count']} prices · {status['distances_count']} distances"
-            )
-        if status.get("error_message"):
-            st.sidebar.error(f"Last refresh error: {status['error_message']}")
-        for warning in status.get("warnings", []):
-            st.sidebar.caption(f"⚠️ {warning}")
+    Carries everything a visitor needs to decide whether to trust the site
+    at all -- how stale the price data actually is (as a number *and* a
+    fresh-to-rotten bar), when it was last pulled, how much of it there is,
+    and a manual refresh control.
 
-        st.sidebar.divider()
-        _render_price_data_age(status)
+    Replaces the old sidebar entirely. Nothing renders into `st.sidebar`
+    anywhere in this module any more, so Streamlit shows no sidebar at all.
+    """
+    with st.container(border=True, key="sc_data_ribbon"):
+        if status is None:
+            st.warning(f"Could not reach the backend at {BACKEND_BASE_URL}. Is it running?")
+            return
 
-    refresh_token = st.sidebar.text_input("Refresh token (if configured)", type="password")
-    if st.sidebar.button("Refresh data now"):
-        with st.sidebar:
-            try:
-                response = _run_with_simulated_progress(
-                    lambda: _trigger_refresh(refresh_token or None),
-                    label="Refreshing...",
-                    # A real refresh hits several external APIs and can
-                    # legitimately take a while (REFRESH_TIMEOUT_SECONDS
-                    # allows up to 120s) -- a longer estimate keeps the
-                    # simulated animation's approach-to-90% pace realistic
-                    # instead of parking early and sitting still for most
-                    # of a real refresh.
-                    estimated_seconds=20.0,
-                )
-            except httpx.HTTPError:
-                st.error(f"Could not reach the backend at {BACKEND_BASE_URL}.")
+        meter_col, facts_col, action_col = st.columns([3, 2, 1], vertical_alignment="top")
+
+        with meter_col:
+            age = status.get("price_data_age")
+            if age:
+                _render_staleness_meter(age)
             else:
-                if response.status_code == 401:
-                    st.error("Refresh rejected: missing or invalid token.")
-                elif response.status_code == 409:
-                    st.error("A refresh is already in progress.")
-                elif response.status_code == 429:
-                    st.error("Too many refresh requests -- please wait a moment and try again.")
-                elif response.status_code != 200:
-                    st.error(f"Refresh failed (HTTP {response.status_code}).")
-                else:
-                    body = response.json()
-                    if body["status"] == "success":
-                        st.success("Refresh complete.")
-                    else:
-                        st.error(f"Refresh failed: {body.get('error_message') or 'unknown error'}")
-                    _fetch_terminals.clear()
-                    _fetch_ships.clear()
-                    st.rerun()
+                st.markdown("**Data freshness**")
+                st.caption("No price data loaded yet.")
 
-    st.sidebar.divider()
-    # Visible attribution credit for the bundled background image, per its
-    # license terms -- see the code comment at `_inject_theme_css()` for the
-    # full source/license record this caption is required to match. Plain
-    # `st.sidebar.caption` markdown, not `unsafe_allow_html` -- a hardcoded
-    # literal constant, not API-sourced text, but there's no HTML/markup
-    # need here at all, so the safer default (Streamlit's own escaping)
-    # applies same as everywhere else in this module.
-    st.sidebar.caption(_BACKGROUND_ATTRIBUTION_MARKDOWN)
+        with facts_col:
+            st.markdown(f"**Status** · {status['status']}")
+            if status.get("completed_at"):
+                # Deliberately "fetched", not "updated": this is when *this
+                # app* last pulled from the external APIs, which says nothing
+                # about how old the prices themselves are -- that's what the
+                # staleness meter beside this reports.
+                st.caption(f"Last fetched from APIs: {status['completed_at']}")
+            if status.get("terminals_count") is not None:
+                st.caption(
+                    f"{status['terminals_count']} terminals · "
+                    f"{status['commodities_count']} commodities · "
+                    f"{status['prices_count']} prices · "
+                    f"{status['distances_count']} distances"
+                )
+            if status.get("error_message"):
+                st.error(f"Last refresh error: {status['error_message']}")
+            for warning in status.get("warnings", []):
+                st.caption(f"⚠️ {warning}")
+
+        with action_col:
+            _render_refresh_control()
+
+
+def _render_refresh_control() -> None:
+    """"Refresh data now", plus the optional shared-secret token.
+
+    The token input lives in a popover rather than sitting permanently in
+    the ribbon: it is only meaningful when the backend actually has
+    `REFRESH_TOKEN` configured (unset is the default), so for essentially
+    every visitor it is dead UI. Keeping it reachable rather than removing
+    it preserves the deployed-with-a-token case.
+    """
+    with st.popover("Token", use_container_width=True):
+        refresh_token = st.text_input("Refresh token (if configured)", type="password")
+
+    if st.button("Refresh data now", use_container_width=True):
+        try:
+            response = _run_with_simulated_progress(
+                lambda: _trigger_refresh(refresh_token or None),
+                label="Refreshing...",
+                # A real refresh hits several external APIs and can
+                # legitimately take a while (REFRESH_TIMEOUT_SECONDS allows
+                # up to 120s) -- a longer estimate keeps the simulated
+                # animation's approach-to-90% pace realistic instead of
+                # parking early and sitting still for most of a real refresh.
+                estimated_seconds=20.0,
+            )
+        except httpx.HTTPError:
+            st.error(f"Could not reach the backend at {BACKEND_BASE_URL}.")
+        else:
+            if response.status_code == 401:
+                st.error("Refresh rejected: missing or invalid token.")
+            elif response.status_code == 409:
+                st.error("A refresh is already in progress.")
+            elif response.status_code == 429:
+                st.error("Too many refresh requests -- please wait a moment and try again.")
+            elif response.status_code != 200:
+                st.error(f"Refresh failed (HTTP {response.status_code}).")
+            else:
+                body = response.json()
+                if body["status"] == "success":
+                    st.success("Refresh complete.")
+                else:
+                    st.error(f"Refresh failed: {body.get('error_message') or 'unknown error'}")
+                _fetch_terminals.clear()
+                _fetch_ships.clear()
+                st.rerun()
+
+
+def _render_footer() -> None:
+    """Page footer: author links plus the background image's required credit.
+
+    The attribution is a license obligation, not decoration (see the source/
+    license record at `_inject_theme_css()`), so it stays visible on the
+    page -- it just lives at the bottom now that the sidebar it used to sit
+    in is gone.
+
+    Plain `st.caption` markdown, not `unsafe_allow_html` -- these are
+    hardcoded literal constants rather than API-sourced text, but there's no
+    markup need here at all, so the safer default (Streamlit's own escaping)
+    applies exactly as it does everywhere else in this module.
+    """
+    with st.container(key="sc_footer"):
+        st.caption(
+            f"Built by Rohan Pinto · [LinkedIn]({_LINKEDIN_URL}) · [GitHub]({_GITHUB_URL})"
+        )
+        st.caption(_BACKGROUND_ATTRIBUTION_MARKDOWN)
 
 
 # --- starting-terminal filtering (System -> Planetoid -> orbital stations) -----
@@ -887,11 +1031,14 @@ def _render_route_search(
     terminals: list[dict], ships: list[dict], status: dict | None = None
 ) -> None:
     if not terminals:
-        st.info("No terminals available yet -- trigger a data refresh from the sidebar first.")
+        st.info("No terminals available yet -- use “Refresh data now” above first.")
         return
     if not ships:
-        st.info("No ships available yet -- trigger a data refresh from the sidebar first.")
+        st.info("No ships available yet -- use “Refresh data now” above first.")
         return
+
+    # --- Constraints: what the traveller has to work with ---------------------
+    st.header("Constraints")
 
     ship_labels = {
         ship["id"]: ship["name"]
@@ -902,15 +1049,38 @@ def _render_route_search(
         "Ship",
         options=list(ship_labels.keys()),
         format_func=lambda ship_id: ship_labels[ship_id],
-        # Same explicit "contains" matching as the starting-terminal picker
-        # below, for the same reason and now for consistency between the
-        # two: this list is ~237 real ships, far too many to scroll, and
-        # Streamlit's default "fuzzy" subsequence matching surfaces
-        # surprising hits when typing a partial ship name.
+        # Same explicit "contains" matching as the terminal picker below, for
+        # the same reason and for consistency between the two: this list is
+        # ~237 real ships, far too many to scroll, and Streamlit's default
+        # "fuzzy" subsequence matching surfaces surprising hits when typing a
+        # partial ship name.
         filter_mode="contains",
+        help="The ship's quantum range gates which jumps are possible; its cargo capacity caps how much can be bought per hop.",
     )
 
-    st.subheader("Starting terminal")
+    hops_col, budget_col, risk_col = st.columns(3)
+    with hops_col:
+        num_hops = st.number_input("Number of hops", min_value=1, value=5, step=1)
+    with budget_col:
+        starting_budget = st.number_input(
+            "Starting budget (aUEC)", min_value=0.0, value=50_000.0, step=1000.0
+        )
+    with risk_col:
+        risk_level = st.slider(
+            "Risk / reward",
+            min_value=0,
+            max_value=10,
+            value=10,
+            help=(
+                "10 is the highest risk and highest reward route. This is because "
+                "highly profitable routes are commonly used and so the price may "
+                "drift significantly due to information staleness."
+            ),
+        )
+
+    # --- Starting area: narrow down, then pick the terminal -------------------
+    st.header("Starting area")
+
     filter_col1, filter_col2, filter_col3 = st.columns(3)
     with filter_col1:
         system = st.selectbox("System", options=[_ALL_OPTION] + _distinct_systems(terminals))
@@ -937,9 +1107,15 @@ def _render_route_search(
     # just picked it from this very selectbox.
     terminal_names = {terminal["id"]: terminal["name"] for terminal in filtered_terminals}
     start_terminal_id = st.selectbox(
-        "Starting terminal",
+        "Terminal",
         options=list(terminal_labels.keys()),
         format_func=lambda terminal_id: terminal_labels[terminal_id],
+        # Required field: `index=None` starts with nothing selected rather
+        # than silently defaulting to whichever terminal happens to sort
+        # first, which would let someone run a search they never actually
+        # chose the starting point for. Validated on submit below.
+        index=None,
+        placeholder="Choose a starting terminal...",
         # Guarantees case-insensitive substring ("contains") matching while
         # typing -- Streamlit's default `filter_mode` ("fuzzy") is a looser
         # in-order-subsequence match that would also happen to satisfy a
@@ -949,27 +1125,10 @@ def _render_route_search(
         filter_mode="contains",
     )
 
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        num_hops = st.number_input("Number of hops", min_value=1, value=5, step=1)
-    with col2:
-        starting_budget = st.number_input(
-            "Starting budget (aUEC)", min_value=0.0, value=50_000.0, step=1000.0
-        )
-    with col3:
-        risk_level = st.slider(
-            "Risk / reward",
-            min_value=0,
-            max_value=10,
-            value=10,
-            help=(
-                "10 = the single most profitable route found. Lower values trade "
-                "some profit for a route that's presumably less likely to already "
-                "be picked over by other players."
-            ),
-        )
-
     if st.button("Find best route", type="primary"):
+        if start_terminal_id is None:
+            st.error("Pick a terminal.")
+            return
         try:
             response = _run_with_simulated_progress(
                 lambda: _search_route(
@@ -986,16 +1145,14 @@ def _render_route_search(
 
 def main() -> None:
     _inject_theme_css()
-    st.title("Star Citizen Trading Route Optimizer")
 
     # Fetched once per rerun and passed down, rather than re-fetched by each
-    # renderer that needs it: the sidebar shows the full status, and the
+    # renderer that needs it: the ribbon shows the full status, and the
     # results area reuses the same response's price-age figures to caveat a
     # computed route at the point the user actually acts on it.
     status = _fetch_refresh_status()
-    _render_sidebar(status)
+    _render_data_ribbon(status)
 
-    st.header("Find a trading route")
     try:
         terminals = _fetch_terminals()
     except httpx.HTTPError:
@@ -1009,6 +1166,7 @@ def main() -> None:
         st.error(f"Could not reach the backend at {BACKEND_BASE_URL} to list ships.")
 
     _render_route_search(terminals, ships, status)
+    _render_footer()
 
 
 main()
