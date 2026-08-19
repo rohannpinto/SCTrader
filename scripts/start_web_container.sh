@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
-# Container entrypoint for the Hugging Face Space (Docker SDK) build of the
-# Star Citizen Trading Route Optimizer.
+# Container entrypoint for the Docker build of the Star Citizen Trading
+# Route Optimizer. Platform-neutral: the exact same image/script works for
+# a local `docker run`, a Render.com Docker web service, or (still, for
+# anyone with a paid PRO plan) a Hugging Face Space -- see README.md's
+# "Deployment: Render (Docker, free tier)" section for the current
+# recommended free option, and its "Deployment: Hugging Face Spaces
+# (Docker)" section for the HF path and why it's no longer free.
 #
 # This script is pure orchestration -- it runs the *exact same* entrypoints
 # CLAUDE.md's "How to run" section already documents for local dev
@@ -8,6 +13,13 @@
 # `streamlit run frontend/app.py`), just sequenced correctly for a single
 # container where both processes have to share one exposed port. No
 # backend/frontend application code is touched by this task.
+#
+# Port: reads `$PORT` (the convention Render -- and most modern PaaS
+# platforms -- inject automatically) and falls back to `7860` (Hugging
+# Face Spaces' fixed port, and a sensible default for a plain local
+# `docker run` with no `-e PORT` set) when it's unset. Streamlit binds to
+# this port; the backend's own port (8000) is unrelated and never exposed
+# outside the container either way.
 #
 # Order of operations:
 #   1. Run a synchronous, one-off data refresh (scripts/refresh_data.py).
@@ -27,8 +39,8 @@
 #   4. `exec` streamlit in the foreground. `exec` replaces this script's
 #      own shell process with streamlit (rather than running it as a
 #      child), so streamlit becomes the container's PID 1 and receives
-#      stop/restart signals directly from Docker/Hugging Face, instead of
-#      a wrapper shell swallowing them.
+#      stop/restart signals directly from Docker/the hosting platform,
+#      instead of a wrapper shell swallowing them.
 #
 # Process-supervision honesty note (see also README.md): this is a single
 # free hobby container, not a production process supervisor. The trap
@@ -47,10 +59,16 @@ cd "$(dirname "$0")/.."  # project root, so `backend`/`frontend` import exactly 
 
 export PYTHONPATH="$(pwd)${PYTHONPATH:+:${PYTHONPATH}}"
 
-echo "[start_hf_space] ---- Star Citizen Trading Route Optimizer: container startup ----"
-echo "[start_hf_space] Working directory: $(pwd)"
+# Dynamic port: the hosting platform injects $PORT (Render always does this;
+# Hugging Face Spaces does not, so 7860 -- its fixed expected port -- is the
+# fallback for that case and for a plain local `docker run` with no -e PORT).
+PORT="${PORT:-7860}"
 
-echo "[start_hf_space] Ensuring data/ directory exists..."
+echo "[start_web_container] ---- Star Citizen Trading Route Optimizer: container startup ----"
+echo "[start_web_container] Working directory: $(pwd)"
+echo "[start_web_container] Frontend will bind to port: ${PORT}"
+
+echo "[start_web_container] Ensuring data/ directory exists..."
 mkdir -p data
 
 # --- 1. Synchronous initial refresh -----------------------------------------
@@ -58,32 +76,32 @@ mkdir -p data
 # scripts/refresh_data.py CLI (which itself calls init_db() first, so this
 # also works from a totally empty data/ directory with no schema yet) and
 # only logs+continues on a nonzero exit rather than failing the container.
-echo "[start_hf_space] Running initial data refresh (python scripts/refresh_data.py)..."
+echo "[start_web_container] Running initial data refresh (python scripts/refresh_data.py)..."
 python scripts/refresh_data.py
 REFRESH_EXIT_CODE=$?
 if [ "$REFRESH_EXIT_CODE" -eq 0 ]; then
-    echo "[start_hf_space] Initial refresh succeeded."
+    echo "[start_web_container] Initial refresh succeeded."
 else
-    echo "[start_hf_space] WARNING: initial refresh failed (exit code ${REFRESH_EXIT_CODE}). Continuing startup anyway -- the auto-refresh scheduler and the UI's manual refresh button remain available once the app is up."
+    echo "[start_web_container] WARNING: initial refresh failed (exit code ${REFRESH_EXIT_CODE}). Continuing startup anyway -- the auto-refresh scheduler and the UI's manual refresh button remain available once the app is up."
 fi
 
 # --- 2. Start the backend in the background ---------------------------------
-echo "[start_hf_space] Starting backend (uvicorn) on 0.0.0.0:8000..."
+echo "[start_web_container] Starting backend (uvicorn) on 0.0.0.0:8000..."
 uvicorn backend.main:app --host 0.0.0.0 --port 8000 &
 BACKEND_PID=$!
 
 # Best-effort cleanup if *this script* (not yet exec'd into streamlit) gets
 # signaled -- see the process-supervision note above for the exec'd case.
-trap 'echo "[start_hf_space] Caught signal, stopping backend (pid ${BACKEND_PID})..."; kill "${BACKEND_PID}" 2>/dev/null' INT TERM
+trap 'echo "[start_web_container] Caught signal, stopping backend (pid ${BACKEND_PID})..."; kill "${BACKEND_PID}" 2>/dev/null' INT TERM
 
 # --- 3. Wait for the backend to actually be ready, bounded ------------------
 BACKEND_READY_TIMEOUT_SECONDS=60
-echo "[start_hf_space] Waiting up to ${BACKEND_READY_TIMEOUT_SECONDS}s for backend readiness (GET /health)..."
+echo "[start_web_container] Waiting up to ${BACKEND_READY_TIMEOUT_SECONDS}s for backend readiness (GET /health)..."
 BACKEND_READY=0
 SECONDS_WAITED=0
 while [ "$SECONDS_WAITED" -lt "$BACKEND_READY_TIMEOUT_SECONDS" ]; do
     if ! kill -0 "$BACKEND_PID" 2>/dev/null; then
-        echo "[start_hf_space] ERROR: backend process exited before becoming ready."
+        echo "[start_web_container] ERROR: backend process exited before becoming ready."
         break
     fi
     if python -c "
@@ -96,7 +114,7 @@ except Exception:
 sys.exit(0)
 " >/dev/null 2>&1; then
         BACKEND_READY=1
-        echo "[start_hf_space] Backend is ready (after ~${SECONDS_WAITED}s)."
+        echo "[start_web_container] Backend is ready (after ~${SECONDS_WAITED}s)."
         break
     fi
     sleep 1
@@ -104,10 +122,10 @@ sys.exit(0)
 done
 
 if [ "$BACKEND_READY" -ne 1 ]; then
-    echo "[start_hf_space] WARNING: backend did not report healthy within ${BACKEND_READY_TIMEOUT_SECONDS}s. Starting the frontend anyway; it will show connection errors until the backend recovers."
+    echo "[start_web_container] WARNING: backend did not report healthy within ${BACKEND_READY_TIMEOUT_SECONDS}s. Starting the frontend anyway; it will show connection errors until the backend recovers."
 fi
 
 # --- 4. Start the frontend in the foreground (becomes the container's main process) ---
 export BACKEND_BASE_URL="http://localhost:8000"
-echo "[start_hf_space] Starting frontend (streamlit) on 0.0.0.0:7860..."
-exec streamlit run frontend/app.py --server.port 7860 --server.address 0.0.0.0 --server.headless true
+echo "[start_web_container] Starting frontend (streamlit) on 0.0.0.0:${PORT}..."
+exec streamlit run frontend/app.py --server.port "${PORT}" --server.address 0.0.0.0 --server.headless true

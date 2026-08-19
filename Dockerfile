@@ -1,9 +1,12 @@
-# Docker image for a free Hugging Face Space (Docker SDK): packages the
-# existing FastAPI backend + Streamlit frontend into a single container so
-# a free Space only needs to expose one process/port. Zero application
-# code changes -- see README.md's "Deployment: Hugging Face Spaces
-# (Docker)" section for the full rationale, and scripts/start_hf_space.sh
-# for the startup orchestration this image's CMD runs.
+# Docker image for the free-hosted build of the Star Citizen Trading Route
+# Optimizer: packages the existing FastAPI backend + Streamlit frontend into
+# a single container so a free-tier host only needs to expose one
+# process/port. Zero application code changes -- see README.md's
+# "Deployment: Render (Docker, free tier)" section (the current recommended
+# free option) and its "Deployment: Hugging Face Spaces (Docker)" section
+# (still workable, just no longer free as of Hugging Face's July 2026 policy
+# change) for the full rationale, and scripts/start_web_container.sh for the
+# startup orchestration this image's CMD runs.
 #
 # Base image: Python 3.12, matching this project's own .venv (Python
 # 3.12.5 -- see requirements.txt's header comment) as closely as a stock
@@ -35,15 +38,19 @@ COPY scripts/ ./scripts/
 # top of that, not a requirement for correctness.
 RUN mkdir -p /app/data
 
-RUN chmod +x scripts/start_hf_space.sh
+RUN chmod +x scripts/start_web_container.sh
 
 ENV PYTHONPATH=/app \
     PYTHONUNBUFFERED=1
 
-# Hugging Face Spaces' Docker SDK routes public traffic to this port
-# (declared again in README.md's YAML frontmatter as `app_port: 7860`).
-# The backend's own port (8000) is deliberately not EXPOSEd here -- it
-# only ever needs to be reachable from inside this same container.
+# Informational only -- Docker's EXPOSE doesn't actually bind or publish
+# anything at runtime. The port actually bound is controlled at runtime by
+# the $PORT env var (see scripts/start_web_container.sh), defaulting to
+# 7860 if $PORT is unset. Render injects $PORT automatically; Hugging Face
+# Spaces expects the fixed port declared in README.md's YAML frontmatter
+# (7860, matching this default). The backend's own port (8000) is
+# deliberately not EXPOSEd here -- it only ever needs to be reachable from
+# inside this same container.
 EXPOSE 7860
 
-CMD ["bash", "scripts/start_hf_space.sh"]
+CMD ["bash", "scripts/start_web_container.sh"]
