@@ -85,7 +85,7 @@ _BACKGROUND_ATTRIBUTION_MARKDOWN = (
     "new-webb-image-captures-clearest-view-of-neptunes-rings-in-decades/)."
 )
 
-st.set_page_config(page_title="SC Trading Route Optimizer", layout="wide")
+st.set_page_config(page_title="SC Trading Route Optimizer", page_icon="🚀", layout="wide")
 
 
 # --- visual theme: background image + dark "sci-fi HUD" styling ----------------
@@ -456,9 +456,54 @@ def _search_route(
 # --- sidebar: data status + manual refresh --------------------------------------
 
 
-def _render_sidebar() -> None:
+def _format_age_days(days: float) -> str:
+    """Human-readable age, e.g. `0.25` -> `"6 hours"`, `7.04` -> `"7.0 days"`.
+
+    Switches to hours under a day so a genuinely fresh dataset doesn't
+    render as an uninformative "0.2 days".
+    """
+    if days < 1.0:
+        hours = max(0, round(days * 24))
+        return "less than an hour" if hours == 0 else f"{hours} hour{'s' if hours != 1 else ''}"
+    return f"{days:.1f} days"
+
+
+def _render_price_data_age(status: dict) -> None:
+    """Surfaces how old the underlying *price reports* are -- not to be
+    confused with when this app last fetched them (`completed_at`, rendered
+    separately above this).
+
+    This distinction is the single most decision-relevant fact in the whole
+    sidebar and was previously invisible: with the hourly auto-refresh
+    scheduler running, "last fetched" is essentially always "minutes ago,"
+    which reads as "this data is current." The prices themselves are
+    crowd-sourced player observations that are typically *days* old (real
+    measured dataset: median ~5-7 days, nothing under 24 hours), and a
+    route computed from a week-old price may simply not exist any more when
+    the player flies it. That gap is also the entire reason this app has a
+    risk/reward slider, so naming it plainly here makes the slider's purpose
+    legible instead of mysterious.
+    """
+    age = status.get("price_data_age")
+    if not age:
+        return
+
+    st.sidebar.markdown("**Price report age**")
+    st.sidebar.caption(
+        f"Median: **{_format_age_days(age['median_age_days'])}** old  \n"
+        f"Freshest: {_format_age_days(age['min_age_days'])} · "
+        f"Stalest: {_format_age_days(age['max_age_days'])}"
+    )
+    st.sidebar.caption(
+        "Prices are crowd-sourced player reports, not a live game feed — "
+        "they are typically days old and may have changed in-game since. "
+        "Lower the risk/reward slider for routes that are likely less "
+        "picked-over."
+    )
+
+
+def _render_sidebar(status: dict | None) -> None:
     st.sidebar.header("Data")
-    status = _fetch_refresh_status()
 
     if status is None:
         st.sidebar.warning(
@@ -467,7 +512,10 @@ def _render_sidebar() -> None:
     else:
         st.sidebar.write(f"Status: **{status['status']}**")
         if status.get("completed_at"):
-            st.sidebar.caption(f"Last completed: {status['completed_at']}")
+            # Deliberately "fetched", not "updated": this is when *this app*
+            # last pulled from the external APIs, which says nothing about how
+            # old the prices themselves are -- see `_render_price_data_age`.
+            st.sidebar.caption(f"Last fetched from APIs: {status['completed_at']}")
         if status.get("terminals_count") is not None:
             st.sidebar.caption(
                 f"{status['terminals_count']} terminals · {status['commodities_count']} commodities · "
@@ -477,6 +525,9 @@ def _render_sidebar() -> None:
             st.sidebar.error(f"Last refresh error: {status['error_message']}")
         for warning in status.get("warnings", []):
             st.sidebar.caption(f"⚠️ {warning}")
+
+        st.sidebar.divider()
+        _render_price_data_age(status)
 
     refresh_token = st.sidebar.text_input("Refresh token (if configured)", type="password")
     if st.sidebar.button("Refresh data now"):
@@ -749,7 +800,9 @@ def _stop_rows(body: dict, start_terminal_name: str) -> list[dict]:
     return rows
 
 
-def _render_route_results(response: httpx.Response, start_terminal_name: str) -> None:
+def _render_route_results(
+    response: httpx.Response, start_terminal_name: str, status: dict | None = None
+) -> None:
     if response.status_code == 404:
         st.error("Unknown starting terminal or ship.")
         return
@@ -776,6 +829,18 @@ def _render_route_results(response: httpx.Response, start_terminal_name: str) ->
         f"({len(body['hops'])} hop{'s' if len(body['hops']) != 1 else ''})"
     )
     _render_rank_transparency(body)
+
+    # Repeated here (as well as in the sidebar) on purpose: this is the
+    # moment the user is about to commit to flying a route, the sidebar can
+    # be collapsed, and the projected profit above is only as good as the
+    # age of the prices it was computed from.
+    price_age = (status or {}).get("price_data_age")
+    if price_age:
+        st.caption(
+            f"Projected from player-reported prices with a median age of "
+            f"{_format_age_days(price_age['median_age_days'])} — actual in-game "
+            f"prices may differ."
+        )
 
     rows = _stop_rows(body, start_terminal_name)
 
@@ -811,7 +876,9 @@ def _render_route_results(response: httpx.Response, start_terminal_name: str) ->
     )
 
 
-def _render_route_search(terminals: list[dict], ships: list[dict]) -> None:
+def _render_route_search(
+    terminals: list[dict], ships: list[dict], status: dict | None = None
+) -> None:
     if not terminals:
         st.info("No terminals available yet -- trigger a data refresh from the sidebar first.")
         return
@@ -828,6 +895,12 @@ def _render_route_search(terminals: list[dict], ships: list[dict]) -> None:
         "Ship",
         options=list(ship_labels.keys()),
         format_func=lambda ship_id: ship_labels[ship_id],
+        # Same explicit "contains" matching as the starting-terminal picker
+        # below, for the same reason and now for consistency between the
+        # two: this list is ~237 real ships, far too many to scroll, and
+        # Streamlit's default "fuzzy" subsequence matching surfaces
+        # surprising hits when typing a partial ship name.
+        filter_mode="contains",
     )
 
     st.subheader("Starting terminal")
@@ -901,13 +974,19 @@ def _render_route_search(terminals: list[dict], ships: list[dict]) -> None:
         except httpx.HTTPError:
             st.error(f"Could not reach the backend at {BACKEND_BASE_URL}.")
             return
-        _render_route_results(response, terminal_names[start_terminal_id])
+        _render_route_results(response, terminal_names[start_terminal_id], status)
 
 
 def main() -> None:
     _inject_theme_css()
     st.title("Star Citizen Trading Route Optimizer")
-    _render_sidebar()
+
+    # Fetched once per rerun and passed down, rather than re-fetched by each
+    # renderer that needs it: the sidebar shows the full status, and the
+    # results area reuses the same response's price-age figures to caveat a
+    # computed route at the point the user actually acts on it.
+    status = _fetch_refresh_status()
+    _render_sidebar(status)
 
     st.header("Find a trading route")
     try:
@@ -922,7 +1001,7 @@ def main() -> None:
         ships = []
         st.error(f"Could not reach the backend at {BACKEND_BASE_URL} to list ships.")
 
-    _render_route_search(terminals, ships)
+    _render_route_search(terminals, ships, status)
 
 
 main()

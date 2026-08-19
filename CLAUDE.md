@@ -605,6 +605,49 @@ shared-context summary.
     (`total_profit=557418.0`) — a real, plausible multi-hop trade route
     through real curated commodities.
 
+## Price-report age vs. fetch time — never conflate these
+
+**`RefreshRun.completed_at` ("when this app last fetched") and
+`Price.source_date_updated` ("when a player actually observed this price
+in-game") are different facts, and only the second one tells a user whether
+a computed route will still hold.** With the Phase 3 hourly auto-refresh
+scheduler running, `completed_at` is essentially always "minutes ago" —
+which reads to a user as "this data is current." It isn't. The wiki/UEX
+price data is crowd-sourced from players who visit a terminal and report
+what they saw, so every `Price` row carries its own `source_date_updated`
+recording when that observation was made.
+
+- **Measured against the real dataset (2026-08-19, 2004 price rows): 100%
+  of rows carry a `source_date_updated`; median report age ~7 days;
+  *zero* rows under 24 hours old; oldest ~34 days.** (Earlier in the
+  project the same measurement against a fresher cache gave a ~4.7-day
+  median — the number drifts, the shape doesn't: this data is always days
+  old, never live.)
+- This gap is the entire reason the risk/reward slider exists (Phase 3):
+  the most profitable route is also the most likely to have already been
+  found and flown by someone else before the price report even reached
+  this app.
+- **Surfaced, not just recorded:** `GET /refresh-status` returns
+  `price_data_age` (`PriceDataAgeOut` in `backend/models/schemas.py`:
+  `priced_rows`, `min_age_days`, `median_age_days`, `max_age_days`),
+  computed by `_price_data_age()` in `backend/routers/refresh.py`.
+  `frontend/app.py` renders it in the sidebar (`_render_price_data_age`)
+  and repeats a one-line caveat in the results area at the moment the user
+  commits to a route. The sidebar's fetch timestamp is labelled "Last
+  fetched from APIs" specifically so it can't be misread as the data's age.
+- **`source_date_updated` is stored naive-UTC** (the wiki API sends
+  ISO-8601 with an explicit `+00:00`, which SQLAlchemy's plain `DateTime`
+  column normalizes to naive UTC on write), so any age computed against it
+  must use UTC "now". Using local time silently skews every age by the
+  host's UTC offset — and looks perfectly correct on a UTC-configured
+  server (CI, the Render deployment) while being hours wrong in local
+  development, which is exactly why
+  `test_price_report_age_is_computed_in_utc_not_local_time`
+  (`tests/integration/test_api.py`) exists as a regression guard.
+- A `Price` row with a `None` `source_date_updated` contributes no age at
+  all rather than counting as "reported just now" — the same
+  missing-vs-zero discipline this codebase applies to prices themselves.
+
 ## Standing security ground rules
 
 These apply to **every** task, not just the ones that mention security

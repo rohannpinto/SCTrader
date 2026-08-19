@@ -309,6 +309,49 @@ class RouteResponse(BaseModel):
         return self
 
 
+class PriceDataAgeOut(BaseModel):
+    """How old the underlying crowd-sourced *price reports* actually are.
+
+    Distinct from `RefreshStatusOut.completed_at`, and the distinction is
+    the entire point of this model. `completed_at` says when this app last
+    *fetched* from the external APIs -- which, with the hourly auto-refresh
+    scheduler running, is almost always "minutes ago" and therefore reads
+    to a user as "this data is current." It isn't: the wiki/UEX price data
+    is crowd-sourced from players who visit a terminal and report what they
+    saw, so each `Price` row carries its own `source_date_updated` -- when
+    that observation was actually made in-game, which is typically *days*
+    before we fetched it (measured against the real live dataset: median
+    report age ~5-7 days, with zero rows under 24 hours old).
+
+    Surfacing only `completed_at` was therefore actively misleading about
+    the one thing that determines whether a computed route will still hold
+    when the player flies it. These ages are what a user needs to judge
+    that, and they're the same underlying reason this app has a risk/reward
+    slider at all (CLAUDE.md's Phase 3 context).
+
+    Ages are computed server-side, in UTC, against `source_date_updated`
+    (stored naive-UTC), so a client never has to reconcile its own clock or
+    timezone against the database's.
+    """
+
+    priced_rows: int = Field(
+        ..., ge=0, description="Number of Price rows carrying a source report date."
+    )
+    min_age_days: float = Field(
+        ..., description="Age of the freshest price report, in days."
+    )
+    median_age_days: float = Field(
+        ...,
+        description=(
+            "Age of the median price report, in days -- the headline "
+            "'how stale is this dataset really' number."
+        ),
+    )
+    max_age_days: float = Field(
+        ..., description="Age of the stalest price report, in days."
+    )
+
+
 class RefreshStatusOut(BaseModel):
     """Status of the most recent (or in-progress) data refresh."""
 
@@ -339,5 +382,14 @@ class RefreshStatusOut(BaseModel):
         description=(
             "Non-fatal warnings from the most recent refresh/graph build, "
             "e.g. graph-density-guardrail notices. Empty when there are none."
+        ),
+    )
+    price_data_age: PriceDataAgeOut | None = Field(
+        default=None,
+        description=(
+            "Age distribution of the underlying crowd-sourced price reports "
+            "-- see PriceDataAgeOut, and note this is NOT the same thing as "
+            "`completed_at`. None when no priced rows exist yet (e.g. before "
+            "the first successful refresh)."
         ),
     )

@@ -24,7 +24,7 @@ from __future__ import annotations
 import json
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
@@ -775,6 +775,109 @@ def test_refresh_status_never_run_before_any_refresh(client):
     body = response.json()
     assert body["status"] == "never_run"
     assert body["data_version"] is None
+    # No priced rows exist yet, so there is no age distribution to report --
+    # explicitly None rather than a zeroed-out object that would read as
+    # "all prices are 0 days old" (i.e. perfectly fresh), the exact
+    # misreading this whole field exists to prevent.
+    assert body["price_data_age"] is None
+
+
+def _seed_prices_with_report_ages(engine, age_days: list[float]) -> None:
+    """Seed one `Price` row per entry in `age_days`, each with a
+    `source_date_updated` that many days before now (UTC), plus the
+    terminals/commodity rows its foreign keys require.
+
+    `source_date_updated` is stored naive-UTC (see `_price_data_age`'s
+    docstring), so these are written naive-UTC too -- writing them in local
+    time is precisely the bug these tests need to be able to catch.
+    """
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    with session_scope(engine) as session:
+        session.add(Commodity(id=1, wiki_uuid="u1", slug="laranite", name="Laranite"))
+        for i, _ in enumerate(age_days, start=1):
+            session.add(Terminal(id=i, name=f"T{i}", is_commodity_trading=True))
+    with session_scope(engine) as session:
+        for i, days in enumerate(age_days, start=1):
+            session.add(
+                Price(
+                    terminal_id=i,
+                    commodity_id=1,
+                    price_buy=100.0,
+                    price_sell=None,
+                    source_date_updated=now - timedelta(days=days),
+                    fetched_at=_now(),
+                )
+            )
+
+
+def test_refresh_status_reports_price_report_age_distribution(client, engine):
+    """The headline of this feature: `/refresh-status` must report how old
+    the *price reports* are, independently of when they were fetched.
+
+    Ages chosen so min/median/max are all distinct and hand-checkable.
+    """
+    with session_scope(engine) as session:
+        session.add(RefreshRun(id=1, started_at=_now(), completed_at=_now(), status="success"))
+    _seed_prices_with_report_ages(engine, [2.0, 5.0, 9.0])
+
+    response = client.get("/refresh-status")
+    assert response.status_code == 200
+    age = response.json()["price_data_age"]
+
+    assert age["priced_rows"] == 3
+    # Tolerance covers only the wall-clock elapsed during the test itself.
+    assert age["min_age_days"] == pytest.approx(2.0, abs=0.01)
+    assert age["median_age_days"] == pytest.approx(5.0, abs=0.01)
+    assert age["max_age_days"] == pytest.approx(9.0, abs=0.01)
+
+
+def test_price_report_age_is_computed_in_utc_not_local_time(client, engine):
+    """Regression guard for a timezone bug that would be invisible in CI.
+
+    `source_date_updated` is naive **UTC**. Computing "now" with
+    `datetime.now()` instead of UTC would skew every reported age by the
+    host's UTC offset -- and would look perfectly correct on a
+    UTC-configured server (including most CI and the Render deployment)
+    while being hours wrong in local development. A freshly-reported price
+    must therefore read as ~0 days old, not +/- the local offset.
+    """
+    with session_scope(engine) as session:
+        session.add(RefreshRun(id=1, started_at=_now(), completed_at=_now(), status="success"))
+    _seed_prices_with_report_ages(engine, [0.0])
+
+    age = client.get("/refresh-status").json()["price_data_age"]
+
+    # A local-time bug on this machine (UTC-4 at time of writing) would put
+    # this at ~0.167 days; anywhere east of UTC it would go negative.
+    assert age["median_age_days"] == pytest.approx(0.0, abs=0.01)
+    assert age["median_age_days"] >= 0.0
+
+
+def test_price_report_age_absent_when_rows_have_no_source_date(client, engine):
+    """A `Price` row with no `source_date_updated` contributes no age.
+
+    Real ingested rows always carry one, but the column is nullable, and a
+    row with an unknown report date must not be silently counted as
+    "reported right now" -- same missing-vs-zero discipline this codebase
+    applies to prices themselves.
+    """
+    with session_scope(engine) as session:
+        session.add(RefreshRun(id=1, started_at=_now(), completed_at=_now(), status="success"))
+        session.add(Commodity(id=1, wiki_uuid="u1", slug="laranite", name="Laranite"))
+        session.add(Terminal(id=1, name="T1", is_commodity_trading=True))
+    with session_scope(engine) as session:
+        session.add(
+            Price(
+                terminal_id=1,
+                commodity_id=1,
+                price_buy=100.0,
+                price_sell=None,
+                source_date_updated=None,
+                fetched_at=_now(),
+            )
+        )
+
+    assert client.get("/refresh-status").json()["price_data_age"] is None
 
 
 # --- /refresh: shared-secret gate --------------------------------------------------

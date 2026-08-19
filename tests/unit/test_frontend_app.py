@@ -230,6 +230,131 @@ def test_app_renders_with_no_ships_yet():
     assert any("No ships available yet" in info.value for info in at.info)
 
 
+# --- price report age (staleness transparency) ----------------------------------
+#
+# The distinction these cover is the whole point of the feature: "last
+# fetched" (when this app pulled from the external APIs -- with the hourly
+# scheduler, almost always minutes ago) is NOT "how old the prices are"
+# (crowd-sourced player reports, typically days old). Conflating the two
+# made a week-old dataset read as current.
+
+
+def _status_with_price_age(
+    *, median_age_days: float, min_age_days: float = 1.0, max_age_days: float = 30.0
+) -> dict:
+    status = _never_run_status()
+    status.update(
+        {
+            "status": "success",
+            "completed_at": "2026-08-19T02:56:20",
+            "price_data_age": {
+                "priced_rows": 2004,
+                "min_age_days": min_age_days,
+                "median_age_days": median_age_days,
+                "max_age_days": max_age_days,
+            },
+        }
+    )
+    return status
+
+
+@respx.mock
+def test_sidebar_reports_price_report_age_in_days():
+    respx.get(f"{BACKEND_BASE_URL}/refresh-status").mock(
+        return_value=httpx.Response(200, json=_status_with_price_age(median_age_days=7.04))
+    )
+    respx.get(f"{BACKEND_BASE_URL}/terminals").mock(return_value=httpx.Response(200, json=[]))
+    respx.get(f"{BACKEND_BASE_URL}/ships").mock(return_value=httpx.Response(200, json=[]))
+
+    at = AppTest.from_file(APP_PATH)
+    at.run()
+
+    assert not at.exception
+    captions = " ".join(c.value for c in at.sidebar.caption)
+    assert "7.0 days" in captions
+    # The caveat naming *why* the age matters must accompany the number --
+    # a bare "7.0 days" doesn't tell a user the prices may have moved.
+    assert "crowd-sourced" in captions
+
+
+@respx.mock
+def test_sidebar_distinguishes_fetch_time_from_report_age():
+    """"Last fetched" and "price report age" must be presented as different
+    things -- the misleading behavior this feature fixes was showing only
+    the former, which reads as "the data is current"."""
+    respx.get(f"{BACKEND_BASE_URL}/refresh-status").mock(
+        return_value=httpx.Response(200, json=_status_with_price_age(median_age_days=7.0))
+    )
+    respx.get(f"{BACKEND_BASE_URL}/terminals").mock(return_value=httpx.Response(200, json=[]))
+    respx.get(f"{BACKEND_BASE_URL}/ships").mock(return_value=httpx.Response(200, json=[]))
+
+    at = AppTest.from_file(APP_PATH)
+    at.run()
+
+    captions = " ".join(c.value for c in at.sidebar.caption)
+    assert "Last fetched from APIs" in captions
+    assert "7.0 days" in captions
+
+
+@respx.mock
+def test_sidebar_formats_sub_day_price_age_in_hours():
+    """A genuinely fresh dataset must not render as an uninformative
+    "0.2 days"."""
+    respx.get(f"{BACKEND_BASE_URL}/refresh-status").mock(
+        return_value=httpx.Response(
+            200, json=_status_with_price_age(median_age_days=0.25, min_age_days=0.25)
+        )
+    )
+    respx.get(f"{BACKEND_BASE_URL}/terminals").mock(return_value=httpx.Response(200, json=[]))
+    respx.get(f"{BACKEND_BASE_URL}/ships").mock(return_value=httpx.Response(200, json=[]))
+
+    at = AppTest.from_file(APP_PATH)
+    at.run()
+
+    captions = " ".join(c.value for c in at.sidebar.caption)
+    assert "6 hours" in captions
+    assert "0.2 days" not in captions
+
+
+@respx.mock
+def test_sidebar_omits_price_age_when_backend_reports_none():
+    """A backend with no priced rows yet (`price_data_age: null`) must
+    render no age section at all, not a "0 days old" one."""
+    status = _never_run_status()
+    status["price_data_age"] = None
+    respx.get(f"{BACKEND_BASE_URL}/refresh-status").mock(
+        return_value=httpx.Response(200, json=status)
+    )
+    respx.get(f"{BACKEND_BASE_URL}/terminals").mock(return_value=httpx.Response(200, json=[]))
+    respx.get(f"{BACKEND_BASE_URL}/ships").mock(return_value=httpx.Response(200, json=[]))
+
+    at = AppTest.from_file(APP_PATH)
+    at.run()
+
+    assert not at.exception
+    captions = " ".join(c.value for c in at.sidebar.caption)
+    assert "crowd-sourced" not in captions
+    assert "days** old" not in captions
+
+
+@respx.mock
+def test_app_still_renders_when_backend_omits_price_data_age_field():
+    """Backward compatibility: a `/refresh-status` response with no
+    `price_data_age` key at all (an older backend) must not crash the UI."""
+    status = _never_run_status()
+    status.pop("price_data_age", None)
+    respx.get(f"{BACKEND_BASE_URL}/refresh-status").mock(
+        return_value=httpx.Response(200, json=status)
+    )
+    respx.get(f"{BACKEND_BASE_URL}/terminals").mock(return_value=httpx.Response(200, json=[]))
+    respx.get(f"{BACKEND_BASE_URL}/ships").mock(return_value=httpx.Response(200, json=[]))
+
+    at = AppTest.from_file(APP_PATH)
+    at.run()
+
+    assert not at.exception
+
+
 @respx.mock
 def test_app_shows_error_when_backend_unreachable():
     respx.get(f"{BACKEND_BASE_URL}/refresh-status").mock(
@@ -758,6 +883,44 @@ def test_app_shows_single_hop_route_buy_only_then_sell_only():
     # Running-cash invariant, once more on the smallest possible route.
     assert row1["Cash After"] == 130.0
     assert math.isclose(row1["Cash After"], 130.0, rel_tol=1e-9, abs_tol=1e-9)
+
+
+@respx.mock
+def test_results_caveat_names_price_age_at_the_point_of_decision():
+    """The projected-profit figure is only as good as the age of the prices
+    it came from, so the results area repeats the staleness caveat -- the
+    sidebar can be collapsed, and this is the moment the user commits to
+    flying the route."""
+    respx.get(f"{BACKEND_BASE_URL}/refresh-status").mock(
+        return_value=httpx.Response(200, json=_status_with_price_age(median_age_days=7.04))
+    )
+    respx.get(f"{BACKEND_BASE_URL}/terminals").mock(
+        return_value=httpx.Response(200, json=_terminals_payload())
+    )
+    respx.get(f"{BACKEND_BASE_URL}/ships").mock(
+        return_value=httpx.Response(200, json=_ships_payload())
+    )
+    respx.post(f"{BACKEND_BASE_URL}/route").mock(
+        return_value=httpx.Response(200, json=_minimal_found_route_response_json())
+    )
+
+    at = AppTest.from_file(APP_PATH)
+    at.run()
+    _find_button(at, "Find best route").click().run(timeout=15)
+
+    assert not at.exception
+    assert any(
+        "median age of 7.0 days" in caption.value for caption in at.caption
+    ), [c.value for c in at.caption]
+
+
+@respx.mock
+def test_results_omit_price_caveat_when_age_unavailable():
+    """No price-age data (e.g. a backend that reports `price_data_age:
+    null`) means no caveat -- never a fabricated "0 days" claim."""
+    at = _run_route_search(_minimal_found_route_response_json())
+
+    assert not any("median age of" in caption.value for caption in at.caption)
 
 
 @respx.mock
