@@ -50,6 +50,13 @@ Phase 3 (Task 22): a "Risk / reward" slider (0-10, default 10) sends
 language rather than echoing those raw 1-10 numbers next to the 0-10
 `risk_level` scale the user actually set (the two scales don't line up
 1:1, so showing both risks a confusing mismatch -- see `_ordinal`).
+
+Price-report age: the sidebar (`_render_price_data_age`) and the results
+area both surface `RefreshStatusOut.price_data_age` -- how old the
+underlying crowd-sourced price *reports* are, which is a different and far
+more decision-relevant fact than when this app last *fetched* them. See
+CLAUDE.md's "Price-report age vs. fetch time" section; showing only the
+fetch timestamp made a week-old dataset read as current.
 """
 
 from __future__ import annotations
