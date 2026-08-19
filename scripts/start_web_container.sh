@@ -18,8 +18,9 @@
 # platforms -- inject automatically) and falls back to `7860` (Hugging
 # Face Spaces' fixed port, and a sensible default for a plain local
 # `docker run` with no `-e PORT` set) when it's unset. Streamlit binds to
-# this port; the backend's own port (8000) is unrelated and never exposed
-# outside the container either way.
+# this port on 0.0.0.0 (the one and only externally-visible listener); the
+# backend binds to 127.0.0.1:8000 (loopback-only -- see step 2 below for
+# why this is bound to loopback specifically, not just "unpublished").
 #
 # Order of operations:
 #   1. Run a synchronous, one-off data refresh (scripts/refresh_data.py).
@@ -86,8 +87,19 @@ else
 fi
 
 # --- 2. Start the backend in the background ---------------------------------
-echo "[start_web_container] Starting backend (uvicorn) on 0.0.0.0:8000..."
-uvicorn backend.main:app --host 0.0.0.0 --port 8000 &
+# Bound to 127.0.0.1, not 0.0.0.0: this backend is for the frontend's own
+# intra-container use only (see BACKEND_BASE_URL below) and must never be a
+# second externally-visible listening port. On Render specifically, the
+# platform auto-detects which port to route the public URL to by scanning
+# for open ports inside the container; a second port open on 0.0.0.0 is a
+# real source of ambiguity there (observed: Render logged "Detected a new
+# open port HTTP:8000" *after* already marking the service live on the
+# correct Streamlit port, which lines up with intermittent "Not Found"
+# responses landing on FastAPI's un-routed "/"). Binding to loopback removes
+# the ambiguity outright -- only one port is ever visible outside this
+# process tree, regardless of platform-specific port-scanning behavior.
+echo "[start_web_container] Starting backend (uvicorn) on 127.0.0.1:8000 (loopback-only, not externally visible)..."
+uvicorn backend.main:app --host 127.0.0.1 --port 8000 &
 BACKEND_PID=$!
 
 # Best-effort cleanup if *this script* (not yet exec'd into streamlit) gets
